@@ -5,28 +5,37 @@ blocks. It records which worker and storage tier currently holds each
 content-addressed block, allowing a router to query likely cache hits without
 moving KV data itself.
 
-This build deliberately uses one process-local in-memory index. It has no
-external storage dependency, but it is soft-state: restarting the Indexer loses
-all placement metadata.
+The Indexer's storage is pluggable behind the `KvIndexerBackend` trait. This
+build ships two backends: a process-local in-memory index (the default) and a
+[Tair KVCache Manager](https://github.com/alibaba/tair-kvcache) (KVCM) backend
+that delegates placement state to a KVCM MetaService. See
+[The KVCM backend](#the-kvcm-backend).
+
+The default in-memory build has no external storage dependency, but it is
+soft-state: restarting the Indexer loses all placement metadata.
 
 ## Architecture
 
 ```text
-SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> in-memory indexer
+SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> indexer ── backend
+                                                        ├─ in-memory index
+                                                        └─ KVCM MetaService
 ```
 
 - SGLang publishes `BlockStored`, `BlockRemoved`, and `AllBlocksCleared` events.
 - One `kv-indexer-bridge` follows each independent worker/rank event stream.
-- One `kv-indexer-server` applies event batches and serves match queries.
-- Placement, worker metadata, reverse holdings, and hit counters live in that
-  server process behind a single read/write lock.
+- One `kv-indexer-server` applies event batches and serves match queries; the
+  selected backend stores the placements.
+- The in-memory backend keeps placement, worker metadata, reverse holdings,
+  and hit counters in the server process behind a single read/write lock.
 
-Each apply RPC is ordered and atomic within the process, and a query sees a
-consistent snapshot. The bridge splits larger worker event batches into
-ordered RPCs of at most 16,384 hashes and 256 actions while keeping per-hash
-metadata aligned. If a later RPC fails, earlier chunks may already be applied;
-there is no rollback or replay. There is no persistence, replication, or state
-sharing between Indexer servers.
+Each apply RPC is ordered and atomic within the in-memory backend, and its
+queries see a consistent snapshot. The bridge splits larger worker event
+batches into ordered RPCs of at most 16,384 hashes and 256 actions while
+keeping per-hash metadata aligned; the KVCM backend may further split one RPC
+into several `ReportEvent` calls under a single deadline. If a later RPC
+fails, earlier chunks may already be applied; there is no rollback or replay.
+There is no state sharing between Indexer servers.
 
 ## Operational contract
 
@@ -34,8 +43,8 @@ Run exactly one Indexer server for a deployment. Multiple bridge processes and
 workers may report to it, but active-active Indexer servers have independent
 state and must not be treated as replicas.
 
-This build has no sequence gate, incarnation fencing, replay recovery, worker
-liveness TTL, or restart recovery:
+The in-memory backend has no sequence gate, incarnation fencing, replay
+recovery, worker liveness TTL, or restart recovery:
 
 - An Indexer restart starts with an empty index.
 - A worker death is not detected; its last placements remain until revoked or
@@ -47,6 +56,14 @@ liveness TTL, or restart recovery:
 Individual report, revoke, and clear mutations are idempotent. A future
 Snapshot plus event-replay mechanism is required before production high
 availability can rebuild state safely after restart or event loss.
+
+The KVCM backend inherits the same bridge semantics (no replay, applies
+unconditional). KVCM owns persistence and capacity eviction. Reporter liveness
+is deliberately *not* used for reclaim: the backend heartbeats every worker it
+has seen for its own lifetime, so an idle worker keeps its cache affinity, and
+a dead worker's placements linger exactly like the in-memory backend's (the
+Router's health intersection keeps them unroutable) until KVCM's capacity
+eviction removes them.
 
 ## In-memory data model
 
@@ -89,7 +106,8 @@ KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
 `KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` sets the maximum number of prefix
 queries executing concurrently and defaults to `32`. Requests above the limit
 are rejected immediately with gRPC `RESOURCE_EXHAUSTED`.
-There is no backend or storage configuration.
+`KV_INDEXER_BACKEND` selects the storage backend: `memory` (default) or
+`kvcm` (see [The KVCM backend](#the-kvcm-backend)).
 
 2. Start one bridge per worker event stream. This FULL+SWA example uses the
 worker URL registered with the Router:
@@ -246,6 +264,186 @@ Required or commonly used bridge variables:
   `KV_INDEXER_MAMBA_TIERS`: servable component tiers
 - `KV_INDEXER_CACHE_SPEC_VERSION`: component-rule version, default `1`
 
+## The KVCM backend
+
+`KV_INDEXER_BACKEND=kvcm` selects `KvcmIndexerBackend`, which stores placements
+in a [Tair KVCache Manager](https://github.com/alibaba/tair-kvcache) (KVCM)
+MetaService instead of the server process. The wire contract is the vendored
+`proto/kvcm_meta_service.proto` (`kv_cache_manager.proto.meta.MetaService`).
+
+```bash
+KV_INDEXER_BACKEND=kvcm \
+KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
+KV_INDEXER_KVCM_ENDPOINT=http://kvcm:50052 \
+KV_INDEXER_KVCM_INSTANCE_ID=my-model-deployment \
+  cargo run --release --bin kv-indexer-server
+```
+
+Translation, both directions:
+
+- `ApplyExternalKvBatch` → `ReportEvent`: the worker id becomes the KVCM
+  reporter id, REPORT becomes `BLOCK_ADD` (one spec per resident component,
+  legacy whole blocks report `full` alone), REVOKE becomes `BLOCK_DELETE`
+  (every component name, a superset removal), and the first batch per worker
+  prepends `NODE_REGISTER`. Heartbeats keep reporters alive so KVCM liveness
+  does not reclaim idle-but-cached workers.
+- `MatchExternalKvPrefix` → `GetHostCacheState` (`QT_PREFIX_MATCH`): per host,
+  the longest contiguous prefix from block 0 — the same quantity the in-memory
+  backend computes. Reporters map back to workers through the address restated
+  on every apply batch; workers with no address cannot be routed and are
+  excluded.
+
+Configuration variables (all under `KV_INDEXER_KVCM_`):
+
+- `ENDPOINT` (required): MetaService gRPC address, e.g. `http://10.0.0.1:50052`
+- `INSTANCE_ID` (required): one KVCM instance per routed model deployment
+- `STORAGE_TYPE`: event-report channel, `l1p5` (default) or `l2`, matching what
+  the deployment's KVCM admin provisioned
+- `REPORT_TIERS`: tiers whose events are forwarded, default `HBM` (see below)
+- `AUTO_REGISTER` (default `0`) with `INSTANCE_GROUP`, `BLOCK_SIZE`,
+  `MODEL_NAME`, `MODEL_DTYPE`: opt-in `RegisterInstance` carried out before the
+  first thing this backend sends -- an apply batch *or* a prefix query, since the
+  Router's first request can arrive before any worker has published a KV event.
+  It declares the `full,swa,mamba` spec names, and restates the block size and
+  model deployment KVCM requires of every registration (a registration without
+  a model name/dtype, or with a non-positive block size, is rejected
+  `INVALID_ARGUMENT`). Against an instance someone else registered with
+  different fields, `DUPLICATE_ENTITY` now fails the query path too, not just
+  applies: the instance stays unroutable (every request `503`) until the
+  mismatch is resolved, which is the intended loud failure for a deployment
+  that should have left this off.
+- `QUERY_TIMEOUT_MS` (default 50, half the Router-side prefix deadline),
+  `APPLY_TIMEOUT_MS` (default 5000, one budget shared by every chunk of a batch).
+  Registration runs on the apply budget, not a caller's: it is a setup call that
+  makes the caller's own request possible. Two first calls racing on a cold
+  deployment may each send one registration; KVCM accepts identical fields, and
+  after the first success no further call does.
+- `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats). It must be
+  comfortably below KVCM's EventReport liveness `heartbeat_timeout_ms`; at most a
+  third of it leaves room for a missed or delayed beat. A reporter that beats
+  too slowly is invisible to KVCM between beats, and its placements are swept
+  once the cleanup grace passes.
+
+Deployment prerequisites on the KVCM side: an event-report storage and an
+instance group listing it as an `event_report_storage_candidates` entry, and a
+registered instance — either by the workers' own KVCM connector (the common
+case; leave `AUTO_REGISTER` off) or by `AUTO_REGISTER=1` in routing-only
+deployments.
+
+Semantics and limitations:
+
+- Host-dram events are dropped by default: deployments running the KVCM
+  connector already manage those placements through the data-plane write path,
+  and double reporting would race eviction. `REPORT_TIERS=HBM,DRAM` widens the
+  set for routing-only deployments. A report tier outside HBM/DRAM (`SSD`) is
+  not servable by the prefix rules: legacy workers still report it, but every
+  worker declaring a cache spec is excluded from answers (warned at startup).
+- `CLEAR_ALL_AT_TIER` has no KVCM equivalent (a `BLOCK_SNAPSHOT` replaces every
+  medium at once). It is skipped with a `WARN`; the worker keeps heartbeating,
+  so its stale placements stay indexed until KVCM's capacity eviction removes
+  them.
+- `MatchExternalKv` (per-block placement) has no KVCM equivalent and answers
+  `UNIMPLEMENTED`; `GetExternalKvHitCounts` stays empty. The prefix query is
+  the only routing signal.
+- The prefix answer is the legacy whole-block quantity: the longest contiguous
+  run of held blocks. Workers whose `cache_spec` requires rules beyond that —
+  an SWA window or a MAMBA boundary — or that report any block whose component
+  detail does not confirm the `full` component (including a zero mask inside a
+  component batch, which the bridge produces for mask-less blocks), are
+  **excluded from the answer entirely** (fail closed, logged once per worker),
+  so the answer stays a lower bound like the in-memory backend's instead of
+  over-reporting. Legacy and FULL-only workers are unaffected.
+- A worker id must not contain `#` (the KVCM location-id separator); the
+  bridge dies on the resulting `INVALID_ARGUMENT`, which is the desired
+  fail-fast for a misconfigured fleet.
+- The instance the backend reports into must declare the `full`, `swa` and
+  `mamba` spec names in its `location_spec_infos` — auto-registration does;
+  a connector-registered instance does too if it registered those spec names.
+  If it does not, every `BLOCK_ADD` fails `INVALID_ARGUMENT` and the bridge
+  exits.
+- The reporter→address map is process-local: after an indexer restart, prefix
+  answers stay empty until each worker's next apply batch restates its
+  address. KVCM's own placements survive; only the join is lost.
+- `snapshot_required` is advisory: KVCM sets it while a reporter has no
+  committed snapshot version, which is the normal state of a delta-only
+  reporter — the request that writes its first delta creates that version — so
+  the backend logs it once per reporter lifecycle and never sends a snapshot.
+  It holds no placement state, so it could not rebuild one after KVCM-side
+  cleanup anyway; until live blocks are re-reported the index under-reports
+  (the safe direction).
+- Reporter liveness is real and destructive: KVCM marks a reporter unavailable
+  after its configured heartbeat timeout and then *deletes* that reporter's
+  placements once the cleanup grace has passed, so a deployment whose KVCM
+  liveness is tighter than `HEARTBEAT_INTERVAL_MS` loses cache affinity for
+  idle workers. When the mismatch is large the reporter never counts as alive at
+  all: every beat lands on a tombstoned node, KVCM sweeps its blocks, and prefix
+  queries keep answering "nothing here" for a worker that has plenty cached --
+  the failure mode is a silently empty index, not an error. Check the two
+  intervals together first when cache affinity looks broken on a fresh
+  deployment. After such a cleanup the next plain report fails
+  `NODE_NOT_REGISTERED`; the retry re-registers the reporter, but the reclaimed
+  blocks stay gone until the worker re-reports them.
+- A `NODE_REGISTER` is resent whenever a report fails with
+  `NODE_NOT_REGISTERED` (a reporter KVCM forgot) or never succeeded, and each
+  heartbeat re-registers in passing. `NODE_NOT_REGISTERED` itself is
+  transient: the bridge retries, and the next report self-heals it.
+- Permanent configuration faults (`INSTANCE_NOT_EXIST`, `UNSUPPORTED`,
+  `REACH_MAX_ENTITY_CAPACITY`, duplicate registration with different fields)
+  surface as `FAILED_PRECONDITION`, which the bridge treats as fatal;
+  transient KVCM failures surface as `UNAVAILABLE` and the Router degrades to
+  load-based routing. KVCM `SERVER_NOT_LEADER` (HA deployments) is
+  `UNAVAILABLE` — this backend does not follow leader redirects.
+
+### Peer-to-peer reuse (supernode)
+
+On a supernode an engine can pull KV blocks from a peer's HBM over the fabric,
+so a worker that holds only part of a prompt's prefix may still be able to serve
+all of it — which can make it a better routing target than the engine holding
+the longest local prefix. `MatchExternalKvPrefix` carries that dimension:
+
+- `MatchExternalKvPrefixRequest.p2p_candidate_hosts` (0 = off, the default) is
+  how many top matching workers the caller wants evaluated; it maps to KVCM's
+  `p2p_host_count`.
+- `ExternalKvPrefixMatch.p2p_prefix_blocks` is the prefix the worker can serve
+  with a peer's help (KVCM's `p2p_1_total_match`), and `p2p_fetch_blocks` is how
+  many blocks that costs it (KVCM's `p2p_1_fetch`). `matched_prefix_blocks` keeps
+  reporting what the worker holds itself, so callers read
+  `max(matched_prefix_blocks, p2p_prefix_blocks)`. A backend with no P2P source
+  reports 0, which that max ignores.
+
+KVCM only merges event-report placements that live on the **L2 / vineyard**
+channel; L1P5 placements never participate in P2P. A supernode deployment that
+wants this dimension must therefore run the indexer with
+`KV_INDEXER_KVCM_STORAGE_TYPE=l2`, matching an event-report storage of type L2
+in the KVCM admin config — with the default `l1p5`, `p2p_1_total_match` comes
+back equal to `local` and the dimension is a no-op. The peer's placements must
+also survive the query's medium filter, which is built from this backend's
+`REPORT_TIERS` (default `HBM`): a peer reporting under a medium the indexer does
+not ask for cannot extend anything. (Whether a peer's HBM should be advertised
+on the L2 channel at all is a KVCM-side design question; it is recorded here
+because the answer decides whether this signal is usable.)
+
+Two further boundaries:
+
+- The answer is a *routing* signal, not a data-plane guarantee. The Router will
+  send the request to a worker whose servable prefix is the largest; actually
+  prefetching the peer-held blocks is the KVCM connector's job, driven by the
+  worker's own radix tree (`connector._batch_get`), which knows nothing about a
+  peer's HBM. Without that prefetch the worker recomputes the extension it was
+  routed for.
+- KVCM merges at most **one** peer's placements into a worker's answer
+  (`MergeHostAndP2PSpecs` with a single `peer_addr`), so `p2p_prefix_blocks` is
+  "this worker plus one peer", never a scatter-gather across several peers.
+
+The Router enables its side of this with `--kv-indexer-p2p-candidates <N>`; see
+its README. This dimension has no metric of its own: the observable evidence is
+the `p2p_*` columns of a query answered with a non-zero candidate count (drive
+`MatchExternalKvPrefix` by hand against the indexer), and on the Router side
+`sgl_router_policy_decisions_total{policy="cache_aware"}` (the `cache_candidate`
+reason fires for a peer-extended pick, though it does not distinguish peer
+extension from a local hit) plus `sgl_router_diverted_overlap_blocks`, whose
+depths count serveable prefixes once a peer can extend them.
+
 ## Tests
 
 No external service is needed:
@@ -255,3 +453,66 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+`tests/kvcm_contract.rs` runs the KVCM backend against an in-process mock
+MetaService, including one end-to-end pass behind the real `KVIndexer` service.
+
+## Live KVCM integration
+
+`tests/kvcm_live.rs` runs the backend against a real Tair KVCache Manager. It is
+`#[ignore]`d and gated on `KVCM_LIVE_ENDPOINT`, so a normal `cargo test` never
+touches it.
+
+`tests/kvcm_live/setup_kvcm.py` builds the manager's own process and
+configuration: it starts `kv_cache_manager_bin`, provisions two event-report
+storages (L1P5 and L2) and an instance group listing them, and registers an
+instance declaring the `full,swa,mamba` spec names. Everything is one command:
+
+```bash
+# once, in the tair-kvcache checkout
+bazelisk build //kv_cache_manager:kv_cache_manager_bin
+
+# in experimental/sgl-router
+python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py start --workdir /tmp/kvcm-live
+source /tmp/kvcm-live/kvcm_live.env
+cargo test -p sgl-kv-indexer --test kvcm_live -- --ignored
+python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py stop --workdir /tmp/kvcm-live
+```
+
+A run that asks for these tests has to have them: with `--ignored`, a missing
+`KVCM_LIVE_ENDPOINT` fails every test with the commands above instead of
+skipping, so `ok. N passed` always means the manager was really driven. Without
+`--ignored` (a plain `cargo test`) they are skipped, which is what keeps an
+ordinary test run independent of any external service. A manager that is set
+but no longer reachable fails fast on a connection probe, naming the endpoint
+and the harness command to diagnose it.
+
+`start` is idempotent (`config` re-applies provisioning, `status` reports the
+process, `stop` kills it), and the workdir keeps the manager's registry, logs and
+a `kvcm_live.env` with the endpoints and instance names the tests read. Pass
+`--kvcm-repo` / `--binary` if the checkout or the binary moved. Both `stop` and
+the reuse path of `start` check that the state file's pid is still the manager
+they started — by the `local://<workdir>/registry.json` URI in its cmdline, which
+no other manager and no wrapper script can carry — before signalling or trusting
+it; a stale workdir cannot make them take down an unrelated process.
+
+A single-test failure that the `status` command reports as `Alive` is not
+explained by the harness: keep the full output (test name and panic message)
+alongside the manager's log tail before rerunning, so the next occurrence can be
+diagnosed from evidence rather than repetition.
+
+The harness provisions deliberately tight liveness (2s heartbeat timeout, 2s
+cleanup grace) so the reclamation tests finish in seconds; production values are
+an order of magnitude larger. That is why every test states its own heartbeat
+interval, and why a deployment should keep `HEARTBEAT_INTERVAL_MS` well below
+whatever the KVCM admin configured.
+
+The suite pins, among others: the `RegisterInstance` fields KVCM requires, the
+environment-variable path that assembles an auto-registering backend
+(`KV_INDEXER_KVCM_*` -> `KvcmBackendConfig::from_env` -> `RegisterInstance`, so
+a renamed variable cannot silently disable the registration),
+`BLOCK_ADD`/`BLOCK_DELETE` spec-name and URI rules, `NODE_REGISTER` resend
+idempotency, reporter liveness and the `NODE_NOT_REGISTERED` self-heal, the
+reported-medium filter, `snapshot_required` semantics, and the raw
+`p2p_host_count = 0` answer (`local`-only, `p2p_1_total_match == local`,
+`p2p_1_fetch == 0`).

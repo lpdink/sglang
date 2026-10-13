@@ -587,6 +587,7 @@ fn prefix_req(hs: &[i64]) -> MatchExternalKvPrefixRequest {
     MatchExternalKvPrefixRequest {
         hashes: hs.to_vec(),
         max_blocks: 0,
+        p2p_candidate_hosts: 0,
     }
 }
 
@@ -668,6 +669,23 @@ async fn prefix_fast_path_matches_default_impl() {
     // Descending order and first-block read are part of the response contract.
     assert_eq!(fast_resp.matches[0].matched_prefix_blocks, 4);
     assert!(fast_resp.blocks_read >= 1);
+    // Placements live in this process: the in-memory backend has no peer to
+    // fetch from, so asking for P2P candidates changes nothing at all — the P2P
+    // columns stay 0 and the match set is the one a local-only query returns.
+    let p2p_resp = fast
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: query.to_vec(),
+            max_blocks: 0,
+            p2p_candidate_hosts: 4,
+        })
+        .await
+        .unwrap();
+    assert_eq!(prefix_pairs(&p2p_resp), prefix_pairs(&fast_resp));
+    assert_eq!(p2p_resp.best_prefix_blocks, 4);
+    assert!(p2p_resp
+        .matches
+        .iter()
+        .all(|m| m.p2p_prefix_blocks == 0 && m.p2p_fetch_blocks == 0));
 }
 
 #[tokio::test]
@@ -754,6 +772,7 @@ async fn prefix_max_blocks_caps_the_scan() {
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
             hashes: vec![1, 2, 3, 4],
             max_blocks: 2,
+            p2p_candidate_hosts: 0,
         })
         .await
         .unwrap();

@@ -53,6 +53,11 @@ impl RadixTreePrefixProvider {
                         worker_id: address.clone(),
                         address,
                         matched_prefix_blocks,
+                        // The tree sees this process's own engines; there is no
+                        // peer to serve a missing block, so the P2P columns are
+                        // always 0 here.
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                     })
                     .collect();
                 PrefixOutcome::Matched {

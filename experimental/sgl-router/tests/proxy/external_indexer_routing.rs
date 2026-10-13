@@ -10,11 +10,16 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
+use sgl_kv_indexer::pb::kv_indexer_server::{KvIndexer, KvIndexerServer};
 use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
+    ExternalKvActionType, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
+    MatchExternalKvResponse, TierType,
 };
 use sgl_kv_indexer::{
-    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
+    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndex,
+    PrefixIndexConfig,
 };
 use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -117,6 +122,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
             endpoint,
             query_deadline: Duration::from_secs(1),
             max_inflight: 4,
+            p2p_candidate_hosts: 0,
         })
         .unwrap(),
     ));
@@ -139,5 +145,94 @@ async fn external_indexer_routes_to_the_cached_worker() {
     assert!(cached.captured.lock().unwrap().last_body.is_some());
     assert!(uncached.captured.lock().unwrap().last_body.is_none());
 
+    server.abort();
+}
+
+/// Records what the Router's client actually sent, so the flag → wire seam has a
+/// test of its own. Everything else about this hop can be right while
+/// `p2p_candidate_hosts` is silently dropped, and a P2P deployment would then
+/// look merely "not helpful" instead of broken.
+#[derive(Clone, Default)]
+struct RecordingIndexer {
+    seen: Arc<std::sync::Mutex<Vec<u32>>>,
+}
+
+#[tonic::async_trait]
+impl KvIndexer for RecordingIndexer {
+    async fn match_external_kv_prefix(
+        &self,
+        request: tonic::Request<MatchExternalKvPrefixRequest>,
+    ) -> Result<tonic::Response<MatchExternalKvPrefixResponse>, tonic::Status> {
+        self.seen
+            .lock()
+            .expect("request recorder")
+            .push(request.into_inner().p2p_candidate_hosts);
+        Ok(tonic::Response::new(Default::default()))
+    }
+
+    async fn apply_external_kv_batch(
+        &self,
+        _request: tonic::Request<ApplyExternalKvBatchRequest>,
+    ) -> Result<tonic::Response<ApplyExternalKvBatchResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn match_external_kv(
+        &self,
+        _request: tonic::Request<MatchExternalKvRequest>,
+    ) -> Result<tonic::Response<MatchExternalKvResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn get_external_kv_hit_counts(
+        &self,
+        _request: tonic::Request<GetExternalKvHitCountsRequest>,
+    ) -> Result<tonic::Response<GetExternalKvHitCountsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+}
+
+/// The configured P2P candidate count must reach the Indexer: `main.rs`'s
+/// `prefix_index_config` turns it into `PrefixIndexConfig`, and this asserts the
+/// last hop, from that config to the query the Indexer answers. Both values are
+/// checked, because "0" is the deployment that must not pay for the dimension.
+#[tokio::test]
+async fn router_client_sends_the_configured_p2p_candidate_count() {
+    let recorder = RecordingIndexer::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn({
+        let recorder = recorder.clone();
+        async move {
+            server_builder()
+                .add_service(KvIndexerServer::new(recorder))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        }
+    });
+
+    let indexer = |p2p_candidate_hosts: u32| {
+        GrpcPrefixIndex::new(PrefixIndexConfig {
+            endpoint: endpoint.clone(),
+            query_deadline: Duration::from_secs(2),
+            max_inflight: 4,
+            p2p_candidate_hosts,
+        })
+        .expect("test endpoint is valid")
+    };
+    indexer(3)
+        .match_prefix(vec![1, 2, 3])
+        .await
+        .expect("query reaches the indexer");
+    indexer(0)
+        .match_prefix(vec![1, 2, 3])
+        .await
+        .expect("query reaches the indexer");
+
+    assert_eq!(
+        recorder.seen.lock().expect("request recorder").clone(),
+        vec![3, 0]
+    );
     server.abort();
 }

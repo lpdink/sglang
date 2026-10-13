@@ -402,6 +402,9 @@ pub struct KvIndexerEndpointConfig {
     pub url: String,
     pub query_timeout_ms: u64,
     pub query_max_inflight: usize,
+    /// Top matching workers per query to evaluate for peer-to-peer reuse;
+    /// 0 keeps queries local-only.
+    pub p2p_candidate_hosts: u32,
 }
 
 /// Eligibility filter configuration.

@@ -1,0 +1,1621 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Live integration tests for the KVCM backend against a *real* Tair KVCache
+//! Manager (KVCM) MetaService, driven through `tests/kvcm_live/setup_kvcm.py`.
+//!
+//!     # in the tair-kvcache checkout
+//!     bazelisk build //kv_cache_manager:kv_cache_manager_bin
+//!     # in experimental/sgl-router
+//!     python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py start --workdir /tmp/kvcm-live
+//!     source /tmp/kvcm-live/kvcm_live.env
+//!     cargo test -p sgl-kv-indexer --test kvcm_live -- --ignored
+//!     python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py stop --workdir /tmp/kvcm-live
+//!
+//! Two guards keep these tests out of every other run: they are `#[ignore]`d,
+//! so a plain `cargo test -p sgl-kv-indexer` never touches the network. A run
+//! that does ask for them (`--ignored`/`--include-ignored`) with no harness
+//! fails instead of skipping: `ok. N passed` then always means the manager was
+//! really driven.
+//!
+//! Unlike `tests/kvcm_contract.rs` (which pins our translation against a mock),
+//! these tests pin *KVCM's* behavior: which events it accepts, what its liveness
+//! does to a silent reporter, and what `GetHostCacheState` answers. Where a test
+//! needs KVCM's raw answer rather than our mapping of it, it talks to the
+//! MetaService directly with the vendored client.
+//!
+//! The harness provisions deliberately tight liveness (2s heartbeat timeout,
+//! 2s cleanup grace), so every backend here sets an explicit heartbeat cadence
+//! and the reclamation tests finish in seconds. A production deployment
+//! provisioned the same way would need the same care: a silent reporter's
+//! placements are *deleted*, not just hidden.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
+use sgl_kv_indexer::kvcm_pb::meta_service_client::MetaServiceClient;
+use sgl_kv_indexer::kvcm_pb::{
+    BlockAddEventParams, BlockDeleteEventParams, CommonResponseHeader, ErrorCode, EventItem,
+    GetHostCacheStateRequest, GetHostCacheStateResponse, HeartbeatEventParams, LocationSpec,
+    LocationSpecInfo, ModelDeployment, NodeRegisterEventParams, QueryType, RegisterInstanceRequest,
+    RegisterInstanceResponse, ReportEventRequest, ReportEventResponse, ReportEventType,
+    StorageType,
+};
+use sgl_kv_indexer::pb::{
+    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
+    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, TierType,
+};
+use sgl_kv_indexer::{KvIndexerBackend, KvcmAutoRegister, KvcmBackendConfig, KvcmIndexerBackend};
+use tonic::transport::Channel;
+
+const ENV_ENDPOINT: &str = "KVCM_LIVE_ENDPOINT";
+const ENV_INSTANCE_ID: &str = "KVCM_LIVE_INSTANCE_ID";
+const ENV_INSTANCE_GROUP: &str = "KVCM_LIVE_INSTANCE_GROUP";
+const ENV_MODEL_NAME: &str = "KVCM_LIVE_MODEL_NAME";
+const ENV_MODEL_DTYPE: &str = "KVCM_LIVE_MODEL_DTYPE";
+/// Written by the harness so a failure can name the workdir it used instead of
+/// assuming the default.
+const ENV_WORKDIR: &str = "KVCM_LIVE_WORKDIR";
+const DEFAULT_LIVE_WORKDIR: &str = "/tmp/kvcm-live";
+
+/// The harness provisions a 2s heartbeat timeout; 300ms keeps every reporter
+/// alive with room for a slow test step.
+const HEARTBEAT: Duration = Duration::from_millis(300);
+/// Generous per-RPC budgets: these tests assert KVCM's answers, not scheduling.
+const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The harness configuration, or `None` when the live tests are not requested.
+struct LiveEnv {
+    endpoint: String,
+    /// Instance registered by `setup_kvcm.py` with the `full`/`swa`/`mamba`
+    /// spec names; tests that exercise the no-auto-register path report here.
+    instance_id: String,
+    instance_group: String,
+    /// The model deployment that instance was registered with: KVCM refuses a
+    /// registration without one, and a re-registration whose fields differ.
+    model_name: String,
+    dtype: String,
+}
+
+fn nonempty_env(key: &str) -> Option<String> {
+    let value = std::env::var(key).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Whether this run explicitly asked for ignored tests (`--ignored` or
+/// `--include-ignored`, both passed straight to the test binary by libtest).
+///
+/// A run that asks for the live suite and then skips it because one variable is
+/// missing reports the same `ok. 17 passed` as a run that verified something.
+/// The suite must not be able to lie about that: an explicit request with no
+/// harness means failure, and only an implicit run (a plain `cargo test`, where
+/// these tests never start) skips silently.
+fn live_suite_requested() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--ignored" || arg == "--include-ignored")
+}
+
+fn live_env() -> Option<LiveEnv> {
+    let Some(endpoint) = nonempty_env(ENV_ENDPOINT) else {
+        assert!(
+            !live_suite_requested(),
+            "--ignored was requested but {ENV_ENDPOINT} is not set, so the live KVCM suite would verify nothing. \
+             Start the manager and source its environment first:\n  \
+             python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py start --workdir /tmp/kvcm-live\n  \
+             source /tmp/kvcm-live/kvcm_live.env"
+        );
+        return None;
+    };
+    let required = |key: &str| {
+        nonempty_env(key).unwrap_or_else(|| {
+            panic!("{ENV_ENDPOINT} is set but {key} is not; source the harness env file")
+        })
+    };
+    let env = LiveEnv {
+        endpoint,
+        instance_id: required(ENV_INSTANCE_ID),
+        instance_group: required(ENV_INSTANCE_GROUP),
+        model_name: required(ENV_MODEL_NAME),
+        dtype: required(ENV_MODEL_DTYPE),
+    };
+    // A manager that is gone (this host's other workflows kill by name) must
+    // read as an environment failure with a next step, not as 17 bare
+    // connection errors that look like assertion failures. The workdir is
+    // whatever the harness was started with, so the printed commands are the
+    // ones that work on this run.
+    if let Err(reason) = probe_endpoint(&env.endpoint) {
+        let workdir =
+            std::env::var(ENV_WORKDIR).unwrap_or_else(|_| DEFAULT_LIVE_WORKDIR.to_string());
+        panic!(
+            "{} is not reachable ({reason}); check the manager with \
+             `python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py status --workdir {workdir}` \
+             and restart it with `start`",
+            env.endpoint
+        );
+    }
+    Some(env)
+}
+
+/// A TCP connect is enough to tell "the manager is running" from "it is gone";
+/// no RPC, no runtime, no protocol.
+fn probe_endpoint(endpoint: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+
+    let Some(host_port) = endpoint
+        .strip_prefix("http://")
+        .map(|rest| rest.trim_end_matches('/'))
+    else {
+        // Not a form this probe understands; the first RPC reports it instead.
+        return Ok(());
+    };
+    let addr = host_port
+        .to_socket_addrs()
+        .map_err(|error| format!("{host_port} is not resolvable: {error}"))?
+        .next()
+        .ok_or_else(|| format!("{host_port} resolves to no address"))?;
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map(|_| ())
+        .map_err(|error| format!("{addr}: {error}"))
+}
+
+/// Skips the test when the harness is not running and this run did not ask for
+/// it; fails loudly when it did (see [`live_suite_requested`]).
+macro_rules! live_env {
+    () => {
+        match live_env() {
+            Some(env) => env,
+            None => {
+                eprintln!("{ENV_ENDPOINT} is not set; skipping live KVCM test");
+                return;
+            }
+        }
+    };
+}
+
+/// KVCM instances are created, never deleted, so every test takes a fresh id:
+/// runs are independent and repeatable against one long-lived manager.
+fn unique(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    format!(
+        "kvci-live-{prefix}-{}-{}",
+        std::process::id(),
+        counter + millis
+    )
+}
+
+fn backend(env: &LiveEnv, instance_id: &str, heartbeat: Option<Duration>) -> KvcmIndexerBackend {
+    let mut config = KvcmBackendConfig::new(env.endpoint.clone(), instance_id);
+    config.query_timeout = RPC_TIMEOUT;
+    config.apply_timeout = RPC_TIMEOUT;
+    config.heartbeat_interval = heartbeat;
+    KvcmIndexerBackend::new(config).expect("the harness endpoint is a valid http endpoint")
+}
+
+fn auto_registering_backend(
+    env: &LiveEnv,
+    instance_id: &str,
+    block_size: u32,
+) -> KvcmIndexerBackend {
+    let mut config = KvcmBackendConfig::new(env.endpoint.clone(), instance_id);
+    config.query_timeout = RPC_TIMEOUT;
+    config.apply_timeout = RPC_TIMEOUT;
+    config.heartbeat_interval = Some(HEARTBEAT);
+    config.auto_register = Some(KvcmAutoRegister {
+        instance_group: env.instance_group.clone(),
+        block_size,
+        model_name: env.model_name.clone(),
+        dtype: env.dtype.clone(),
+    });
+    KvcmIndexerBackend::new(config).expect("the harness endpoint is a valid http endpoint")
+}
+
+/// Sets process environment variables for one test and restores them on drop.
+/// Only the env tests below use it, and no other test in this binary reads
+/// `KV_INDEXER_KVCM_*`, so the global mutation stays contained.
+struct EnvGuard(Vec<(String, Option<String>)>);
+
+impl EnvGuard {
+    fn set(pairs: &[(&str, &str)]) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                (key.to_string(), previous)
+            })
+            .collect();
+        Self(saved)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// A legacy (whole-block, mask-less) worker reporting `hashes` on HBM.
+fn report_batch(
+    worker: &str,
+    address: &str,
+    seq: u64,
+    hashes: &[i64],
+) -> ApplyExternalKvBatchRequest {
+    ApplyExternalKvBatchRequest {
+        worker_id: worker.to_string(),
+        seq,
+        actions: vec![ExternalKvAction {
+            r#type: ExternalKvActionType::ActionReport as i32,
+            tier: TierType::TierHbm as i32,
+            hashes: hashes.to_vec(),
+            component_masks: Vec::new(),
+            block_sizes: Vec::new(),
+            parent_block_hash: None,
+        }],
+        worker_address: address.to_string(),
+        cache_spec: None,
+    }
+}
+
+fn revoke_batch(
+    worker: &str,
+    address: &str,
+    seq: u64,
+    hashes: &[i64],
+) -> ApplyExternalKvBatchRequest {
+    let mut batch = report_batch(worker, address, seq, hashes);
+    batch.actions[0].r#type = ExternalKvActionType::ActionRevoke as i32;
+    batch
+}
+
+fn clear_batch(worker: &str, address: &str, seq: u64) -> ApplyExternalKvBatchRequest {
+    ApplyExternalKvBatchRequest {
+        worker_id: worker.to_string(),
+        seq,
+        actions: vec![ExternalKvAction {
+            r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+            tier: TierType::TierHbm as i32,
+            hashes: Vec::new(),
+            component_masks: Vec::new(),
+            block_sizes: Vec::new(),
+            parent_block_hash: None,
+        }],
+        worker_address: address.to_string(),
+        cache_spec: None,
+    }
+}
+
+async fn prefix(
+    backend: &KvcmIndexerBackend,
+    hashes: &[i64],
+    max_blocks: u32,
+) -> MatchExternalKvPrefixResponse {
+    prefix_with_p2p(backend, hashes, max_blocks, 0).await
+}
+
+/// A prefix query with an explicit P2P candidate budget (the wire
+/// `p2p_candidate_hosts`, forwarded to KVCM as `p2p_host_count`).
+async fn prefix_with_p2p(
+    backend: &KvcmIndexerBackend,
+    hashes: &[i64],
+    max_blocks: u32,
+    p2p_candidate_hosts: u32,
+) -> MatchExternalKvPrefixResponse {
+    backend
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: hashes.to_vec(),
+            max_blocks,
+            p2p_candidate_hosts,
+        })
+        .await
+        .expect("prefix query succeeds")
+}
+
+/// `address → matched prefix` for the answer, so assertions read as sets.
+fn prefixes_by_address(response: &MatchExternalKvPrefixResponse) -> HashMap<String, u32> {
+    response
+        .matches
+        .iter()
+        .map(|entry| (entry.worker_address.clone(), entry.matched_prefix_blocks))
+        .collect()
+}
+
+/// `address → (matched, p2p, fetch)` for the answer.
+fn p2p_fields_by_address(
+    response: &MatchExternalKvPrefixResponse,
+) -> HashMap<String, (u32, u32, u32)> {
+    response
+        .matches
+        .iter()
+        .map(|entry| {
+            (
+                entry.worker_address.clone(),
+                (
+                    entry.matched_prefix_blocks,
+                    entry.p2p_prefix_blocks,
+                    entry.p2p_fetch_blocks,
+                ),
+            )
+        })
+        .collect()
+}
+
+// --- Raw MetaService helpers ------------------------------------------------
+
+/// Talks to KVCM directly, for behavior our backend hides or maps away
+/// (snapshot flags, raw `p2p_1_*` fields, medium filtering).
+struct RawKvcm {
+    client: MetaServiceClient<Channel>,
+    instance_id: String,
+    trace: AtomicU64,
+}
+
+fn header_code(header: Option<&CommonResponseHeader>) -> ErrorCode {
+    header
+        .and_then(|header| header.status.as_ref())
+        .and_then(|status| ErrorCode::try_from(status.code).ok())
+        .unwrap_or(ErrorCode::UnknownError)
+}
+
+impl RawKvcm {
+    async fn connect(
+        env: &LiveEnv,
+        instance_id: &str,
+        spec_names: &[&str],
+        block_size: i32,
+    ) -> Self {
+        let client = MetaServiceClient::connect(env.endpoint.clone())
+            .await
+            .expect("KVCM gRPC endpoint is reachable");
+        let mut raw = Self {
+            client,
+            instance_id: instance_id.to_string(),
+            trace: AtomicU64::new(0),
+        };
+        let request = RegisterInstanceRequest {
+            trace_id: raw.next_trace("register"),
+            instance_group: env.instance_group.clone(),
+            instance_id: instance_id.to_string(),
+            block_size,
+            location_spec_infos: spec_names
+                .iter()
+                .map(|name| LocationSpecInfo {
+                    name: name.to_string(),
+                    size: 0,
+                })
+                .collect(),
+            model_deployment: Some(ModelDeployment {
+                model_name: env.model_name.clone(),
+                dtype: env.dtype.clone(),
+                ..Default::default()
+            }),
+            location_spec_groups: Vec::new(),
+            default_query_type: QueryType::QtPrefixMatch as i32,
+        };
+        let response: RegisterInstanceResponse = raw
+            .client
+            .register_instance(request)
+            .await
+            .expect("RegisterInstance RPC completes")
+            .into_inner();
+        assert_eq!(
+            header_code(response.header.as_ref()),
+            ErrorCode::Ok,
+            "RegisterInstance must succeed for a fresh instance"
+        );
+        raw
+    }
+
+    fn next_trace(&self, what: &str) -> String {
+        format!(
+            "kvci-live-{}-{}",
+            what,
+            self.trace.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    async fn report(
+        &mut self,
+        host: &str,
+        storage: StorageType,
+        events: Vec<EventItem>,
+    ) -> ReportEventResponse {
+        let request = ReportEventRequest {
+            trace_id: self.next_trace("apply"),
+            instance_id: self.instance_id.clone(),
+            host_ip_port: host.to_string(),
+            events,
+            storage_type: storage as i32,
+        };
+        self.client
+            .report_event(request)
+            .await
+            .expect("ReportEvent RPC completes")
+            .into_inner()
+    }
+
+    async fn query(
+        &mut self,
+        hashes: &[i64],
+        medium: &[&str],
+        p2p_host_count: i32,
+    ) -> GetHostCacheStateResponse {
+        let request = GetHostCacheStateRequest {
+            trace_id: self.next_trace("query"),
+            instance_id: self.instance_id.clone(),
+            query_type: QueryType::QtPrefixMatch as i32,
+            block_cache_keys: hashes.to_vec(),
+            medium: medium.iter().map(|m| m.to_string()).collect(),
+            p2p_host_count,
+        };
+        let response = self
+            .client
+            .get_host_cache_state(request)
+            .await
+            .expect("GetHostCacheState RPC completes")
+            .into_inner();
+        assert_eq!(
+            header_code(response.header.as_ref()),
+            ErrorCode::Ok,
+            "GetHostCacheState must succeed"
+        );
+        response
+    }
+}
+
+/// The reporter's URI convention (channel scheme + reporter authority +
+/// medium), which KVCM requires to be structurally valid.
+fn spec_uri(host: &str, medium: &str) -> String {
+    format!("event_report://{host}/{medium}")
+}
+
+fn node_register(mediums: &[&str]) -> EventItem {
+    EventItem {
+        event_type: ReportEventType::EventNodeRegister as i32,
+        event_params: Some(EventParams::NodeRegister(NodeRegisterEventParams {
+            mediums: mediums.iter().map(|m| m.to_string()).collect(),
+        })),
+    }
+}
+
+fn block_add(block_key: i64, medium: &str, host: &str, spec_names: &[&str]) -> EventItem {
+    EventItem {
+        event_type: ReportEventType::EventBlockAdd as i32,
+        event_params: Some(EventParams::BlockAdd(BlockAddEventParams {
+            block_key: block_key.to_string(),
+            uri: String::new(),
+            medium: medium.to_string(),
+            specs: spec_names
+                .iter()
+                .map(|name| LocationSpec {
+                    name: name.to_string(),
+                    uri: spec_uri(host, medium),
+                })
+                .collect(),
+        })),
+    }
+}
+
+fn block_delete(block_key: i64, medium: &str, spec_names: &[&str]) -> EventItem {
+    EventItem {
+        event_type: ReportEventType::EventBlockDelete as i32,
+        event_params: Some(EventParams::BlockDelete(BlockDeleteEventParams {
+            block_key: block_key.to_string(),
+            medium: medium.to_string(),
+            spec_names: spec_names.iter().map(|name| name.to_string()).collect(),
+        })),
+    }
+}
+
+fn heartbeat() -> EventItem {
+    EventItem {
+        event_type: ReportEventType::EventHeartbeat as i32,
+        event_params: Some(EventParams::Heartbeat(HeartbeatEventParams::default())),
+    }
+}
+
+fn assert_ok(response: &ReportEventResponse, what: &str) {
+    assert_eq!(
+        header_code(response.header.as_ref()),
+        ErrorCode::Ok,
+        "{what}: item_results={:?} extra_info={}",
+        response.item_results,
+        response.extra_info
+    );
+}
+
+fn locals(response: &GetHostCacheStateResponse) -> HashMap<String, i64> {
+    response
+        .hosts
+        .iter()
+        .map(|host| (host.host_ip_port.clone(), host.local))
+        .collect()
+}
+
+// --- Ingestion: what KVCM accepts ------------------------------------------
+
+/// The operator-facing entry point, end to end: environment variables
+/// (`KvcmBackendConfig::from_env`) assemble an auto-registering backend that a
+/// real manager accepts. Everything else in this file builds the config
+/// programmatically, so this is the one test that would catch a renamed or
+/// unenforced variable — the failure mode being a registration KVCM rejects,
+/// which makes the bridge exit, not a quiet misconfiguration.
+#[tokio::test]
+#[ignore]
+async fn environment_configuration_registers_and_reports() {
+    let env = live_env!();
+    let instance = unique("env");
+    // The variable names are spelled out here rather than imported: a typo in
+    // the constant is exactly what this test exists to catch.
+    let _guard = EnvGuard::set(&[
+        ("KV_INDEXER_KVCM_ENDPOINT", env.endpoint.as_str()),
+        ("KV_INDEXER_KVCM_INSTANCE_ID", instance.as_str()),
+        ("KV_INDEXER_KVCM_AUTO_REGISTER", "1"),
+        (
+            "KV_INDEXER_KVCM_INSTANCE_GROUP",
+            env.instance_group.as_str(),
+        ),
+        // A positive block size and the model deployment are mandatory for
+        // KVCM's RegisterInstance.
+        ("KV_INDEXER_KVCM_BLOCK_SIZE", "128"),
+        ("KV_INDEXER_KVCM_MODEL_NAME", env.model_name.as_str()),
+        ("KV_INDEXER_KVCM_MODEL_DTYPE", env.dtype.as_str()),
+        // The harness provisions 2s liveness, so the configured cadence matters.
+        ("KV_INDEXER_KVCM_HEARTBEAT_INTERVAL_MS", "300"),
+    ]);
+    let backend = KvcmIndexerBackend::new(
+        KvcmBackendConfig::from_env().expect("the environment assembles a config"),
+    )
+    .expect("the harness endpoint is a valid http endpoint");
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30014";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[181, 182]))
+        .await
+        .expect("an environment-configured backend registers and reports");
+    assert_eq!(
+        prefixes_by_address(&prefix(&backend, &[181, 182], 0).await),
+        HashMap::from([(address.to_string(), 2)])
+    );
+}
+
+/// The auto-registration path end to end: `RegisterInstance` with `full`/
+/// `swa`/`mamba` `size: 0` specs, then reports landing as prefixes.
+#[tokio::test]
+#[ignore]
+async fn auto_registration_reports_and_answers_prefixes() {
+    let env = live_env!();
+    let instance = unique("auto");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let w0 = format!("{instance}-w0");
+    let w1 = format!("{instance}-w1");
+
+    backend
+        .apply_external_kv_batch(report_batch(
+            &w0,
+            "http://127.0.0.1:30001",
+            1,
+            &[11, 12, 13],
+        ))
+        .await
+        .expect("auto-registered instance accepts a first report");
+    backend
+        .apply_external_kv_batch(report_batch(&w1, "http://127.0.0.1:30002", 1, &[11]))
+        .await
+        .expect("a second reporter joins the same instance");
+
+    let answer = prefix(&backend, &[11, 12, 13], 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([
+            ("http://127.0.0.1:30001".to_string(), 3),
+            ("http://127.0.0.1:30002".to_string(), 1),
+        ]),
+        "KVCM answers the local prefix per reporter"
+    );
+    assert_eq!(answer.best_prefix_blocks, 3);
+    assert_eq!(answer.blocks_read, 3);
+    // The indexer's own contract: longest prefix first.
+    assert_eq!(
+        answer
+            .matches
+            .iter()
+            .map(|entry| entry.matched_prefix_blocks)
+            .collect::<Vec<_>>(),
+        [3, 1]
+    );
+
+    // KVCM's `local` is bounded by the query, so a longer report cannot
+    // over-report; the backend's clamp stays a safety net, not a fixup.
+    let answer = prefix(&backend, &[11, 12], 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([
+            ("http://127.0.0.1:30001".to_string(), 2),
+            ("http://127.0.0.1:30002".to_string(), 1),
+        ])
+    );
+    assert_eq!(answer.blocks_read, 2);
+}
+
+/// The router's first request is a prefix query on an instance no worker has
+/// reported into yet. With auto-registration configured, that query must
+/// register the instance on its own -- KVCM answers `INSTANCE_NOT_EXIST`
+/// otherwise, which the backend classifies as permanent and the router turns
+/// into a 503 for every request until some other path warms a worker. Without
+/// auto-registration, a missing instance stays exactly that loud.
+#[tokio::test]
+#[ignore]
+async fn a_query_before_any_report_registers_the_instance() {
+    let env = live_env!();
+    let instance = unique("earlyquery");
+    let keys = [9101, 9102, 9103];
+
+    // No apply has run, so KVCM has never heard of this instance.
+    let backend = channel_backend(&env, &instance, StorageType::StEventReportL2);
+    let answer = prefix_with_p2p(&backend, &keys, 0, 0).await;
+    assert!(
+        answer.matches.is_empty(),
+        "a fresh instance holds nothing: {answer:?}"
+    );
+    assert_eq!(answer.blocks_read, 3);
+
+    // The registration reached KVCM rather than only flipping our own flag: a
+    // second backend, which must not register anything, can query the same
+    // instance. Under the old order this is where INSTANCE_NOT_EXIST appeared.
+    let mut config = KvcmBackendConfig::new(env.endpoint.clone(), &instance);
+    config.storage_type = StorageType::StEventReportL2;
+    config.query_timeout = RPC_TIMEOUT;
+    let observer =
+        KvcmIndexerBackend::new(config).expect("the harness endpoint is a valid endpoint");
+    let answer = prefix_with_p2p(&observer, &keys, 0, 0).await;
+    assert!(answer.matches.is_empty());
+
+    // A deployment that configured no auto-registration keeps the fault: a
+    // typo'd instance id is a configuration error, not a transient condition.
+    let mut stranger_config = KvcmBackendConfig::new(env.endpoint.clone(), unique("nodice"));
+    stranger_config.query_timeout = RPC_TIMEOUT;
+    let stranger = KvcmIndexerBackend::new(stranger_config).expect("valid endpoint");
+    let error = stranger
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: keys.to_vec(),
+            max_blocks: 0,
+            p2p_candidate_hosts: 0,
+        })
+        .await
+        .expect_err("an unknown instance is a permanent fault");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    // And the instance the query registered is usable, not just present.
+    let address = "http://127.0.0.1:31031";
+    report_keys(&backend, &format!("{instance}-w0"), address, &keys).await;
+    let answer = prefix_with_p2p(&backend, &keys, 0, 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([(address.to_string(), 3)])
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn max_blocks_truncates_the_query() {
+    let env = live_env!();
+    let instance = unique("truncate");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let worker = format!("{instance}-w0");
+
+    backend
+        .apply_external_kv_batch(report_batch(
+            &worker,
+            "http://127.0.0.1:30003",
+            1,
+            &[21, 22, 23],
+        ))
+        .await
+        .expect("report succeeds");
+
+    let answer = prefix(&backend, &[21, 22, 23], 2).await;
+    assert_eq!(answer.blocks_read, 2);
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([("http://127.0.0.1:30003".to_string(), 2)])
+    );
+}
+
+/// The deployment-registered path: no `AUTO_REGISTER`, an instance the harness
+/// (standing in for the KVCM connector) already registered with our spec names.
+#[tokio::test]
+#[ignore]
+async fn reports_into_an_instance_registered_by_the_deployment() {
+    let env = live_env!();
+    let backend = backend(&env, &env.instance_id, Some(HEARTBEAT));
+    let worker = unique("external");
+
+    backend
+        .apply_external_kv_batch(report_batch(
+            &worker,
+            "http://127.0.0.1:30004",
+            1,
+            &[31, 32],
+        ))
+        .await
+        .expect("a pre-registered instance accepts our spec names without auto-registration");
+
+    let answer = prefix(&backend, &[31, 32], 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([("http://127.0.0.1:30004".to_string(), 2)])
+    );
+}
+
+/// Re-registering an existing instance with identical fields is a no-op; any
+/// field mismatch is a permanent fault. The harness registers this instance
+/// with exactly what `KvcmAutoRegister` sends, so the first must hold.
+#[tokio::test]
+#[ignore]
+async fn re_registration_is_idempotent_and_mismatches_are_permanent() {
+    let env = live_env!();
+    let identical = auto_registering_backend(&env, &env.instance_id, 128);
+    identical
+        .apply_external_kv_batch(report_batch(
+            &unique("idempotent"),
+            "http://127.0.0.1:30005",
+            1,
+            &[41],
+        ))
+        .await
+        .expect("identical re-registration is idempotent");
+
+    let mismatched = auto_registering_backend(&env, &env.instance_id, 256);
+    let error = mismatched
+        .apply_external_kv_batch(report_batch(
+            &unique("mismatch"),
+            "http://127.0.0.1:30006",
+            1,
+            &[42],
+        ))
+        .await
+        .expect_err("a field mismatch is a permanent configuration fault");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("already registered"),
+        "unexpected message: {}",
+        error.message()
+    );
+}
+
+/// `BLOCK_ADD` specs must name specs the instance declared: the harness
+/// instance declares `full`/`swa`/`mamba`, an instance declaring anything else
+/// rejects every report (the bridge exits instead of retrying forever).
+#[tokio::test]
+#[ignore]
+async fn reports_into_an_instance_without_our_spec_names_fail() {
+    let env = live_env!();
+    let instance = unique("specs");
+    let mut raw = RawKvcm::connect(&env, &instance, &["tp0"], 128).await;
+    let backend = backend(&env, &instance, Some(HEARTBEAT));
+
+    let error = backend
+        .apply_external_kv_batch(report_batch(
+            &format!("{instance}-w0"),
+            "http://127.0.0.1:30007",
+            1,
+            &[51],
+        ))
+        .await
+        .expect_err("an instance without the `full` spec name rejects BLOCK_ADD");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error.message().contains("KVCM rejected ReportEvent"),
+        "unexpected message: {}",
+        error.message()
+    );
+
+    // The rejection names no reporter, so nothing was indexed.
+    let answer = raw.query(&[51], &["hbm"], 0).await;
+    assert!(answer.hosts.is_empty(), "rejected blocks must not index");
+}
+
+/// A reporter KVCM never saw, or forgot, is a permanent fault for the query
+/// path (the bridge's retry is what re-registers it).
+#[tokio::test]
+#[ignore]
+async fn unknown_instance_is_a_permanent_fault() {
+    let env = live_env!();
+    let backend = backend(&env, &unique("missing"), None);
+    let worker = unique("unknown");
+
+    let error = backend
+        .apply_external_kv_batch(report_batch(&worker, "http://127.0.0.1:30008", 1, &[61]))
+        .await
+        .expect_err("ReportEvent for an unknown instance fails");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+
+    let error = backend
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: vec![61],
+            max_blocks: 0,
+            p2p_candidate_hosts: 0,
+        })
+        .await
+        .expect_err("GetHostCacheState for an unknown instance fails");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+}
+
+/// `BLOCK_DELETE` must name registered specs. Our REVOKE sends every component
+/// name as a superset removal, which is only legal because the instance
+/// declares them all.
+#[tokio::test]
+#[ignore]
+async fn block_delete_requires_registered_spec_names() {
+    let env = live_env!();
+    let instance = unique("delete");
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let host = "10.5.0.1:8080";
+
+    assert_ok(
+        &raw.report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![
+                node_register(&["hbm"]),
+                block_add(161, "hbm", host, &["full"]),
+                block_add(162, "hbm", host, &["full"]),
+            ],
+        )
+        .await,
+        "initial report",
+    );
+
+    let rejected = raw
+        .report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![block_delete(161, "hbm", &["not_a_spec"])],
+        )
+        .await;
+    assert_eq!(
+        header_code(rejected.header.as_ref()),
+        ErrorCode::InvalidArgument,
+        "an unregistered spec name is rejected outright"
+    );
+    assert_eq!(
+        locals(&raw.query(&[161, 162], &["hbm"], 0).await),
+        HashMap::from([(host.to_string(), 2)]),
+        "a rejected delete must not remove anything"
+    );
+
+    // The backend's superset removal: this reporter only ever stored `full`,
+    // and naming the other components too is a no-op for them.
+    assert_ok(
+        &raw.report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![block_delete(161, "hbm", &["full", "swa", "mamba"])],
+        )
+        .await,
+        "superset delete",
+    );
+    assert_eq!(
+        locals(&raw.query(&[162], &["hbm"], 0).await),
+        HashMap::from([(host.to_string(), 1)])
+    );
+    assert!(
+        raw.query(&[161], &["hbm"], 0).await.hosts.is_empty(),
+        "the deleted block is gone"
+    );
+}
+
+/// Re-sending `NODE_REGISTER` for an existing reporter is accepted, and the
+/// placements reported before it stay readable (KVCM merges the node instead of
+/// replacing it).
+#[tokio::test]
+#[ignore]
+async fn node_register_resend_is_idempotent() {
+    let env = live_env!();
+    let instance = unique("register");
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let host = "10.1.2.3:8080";
+
+    let first = raw
+        .report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![
+                node_register(&["hbm"]),
+                block_add(71, "hbm", host, &["full"]),
+                block_add(72, "hbm", host, &["full"]),
+            ],
+        )
+        .await;
+    assert_ok(&first, "initial registration and report");
+    assert!(first.item_results.is_empty(), "no per-item failures");
+
+    let again = raw
+        .report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![
+                node_register(&["hbm"]),
+                block_add(73, "hbm", host, &["full"]),
+            ],
+        )
+        .await;
+    assert_ok(&again, "repeated NODE_REGISTER");
+
+    let answer = raw.query(&[71, 72, 73], &["hbm"], 0).await;
+    assert_eq!(
+        locals(&answer),
+        HashMap::from([(host.to_string(), 3)]),
+        "re-registration must not invalidate earlier placements"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn revokes_remove_single_blocks() {
+    let env = live_env!();
+    let instance = unique("revoke");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30009";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[81, 82, 83]))
+        .await
+        .expect("report succeeds");
+    backend
+        .apply_external_kv_batch(revoke_batch(&worker, address, 2, &[82]))
+        .await
+        .expect("revoke succeeds");
+
+    let answer = prefix(&backend, &[81, 82, 83], 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([(address.to_string(), 1)]),
+        "the revoked block ends the prefix"
+    );
+}
+
+// --- Liveness ---------------------------------------------------------------
+
+/// The boundary the README documents: heartbeats keep an idle reporter's
+/// placements routable, silence lets KVCM delete them.
+#[tokio::test]
+#[ignore]
+async fn heartbeats_keep_an_idle_reporter_alive() {
+    let env = live_env!();
+    let instance = unique("alive");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30010";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[91, 92, 93]))
+        .await
+        .expect("report succeeds");
+
+    // Longer than the harness heartbeat timeout + cleanup grace (2s + 2s).
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    let answer = prefix(&backend, &[91, 92, 93], 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([(address.to_string(), 3)]),
+        "a heartbeating reporter keeps its placements"
+    );
+}
+
+/// A silent reporter is reclaimed — placements deleted, not hidden — and its
+/// next report fails `NODE_NOT_REGISTERED` until a `NODE_REGISTER` clears the
+/// tombstone. That is exactly the sequence the backend's self-heal handles:
+/// one rejected batch, then a successful retry carrying the registration.
+#[tokio::test]
+#[ignore]
+async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
+    let env = live_env!();
+    let instance = unique("reclaim");
+    // The instance is registered directly so that no heartbeating backend ever
+    // owns the reporter: silence is what this test needs.
+    let _raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let silent = backend(&env, &instance, None);
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30011";
+
+    silent
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[101, 102, 103]))
+        .await
+        .expect("first report registers the reporter and its blocks");
+    assert_eq!(
+        prefix(&silent, &[101, 102, 103], 0)
+            .await
+            .best_prefix_blocks,
+        3
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let answer = prefix(&silent, &[101, 102, 103], 0).await;
+        if answer.matches.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "KVCM never stopped answering the silent reporter: {:?}",
+            answer.matches
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Becoming unroutable is immediate; the tombstone that rejects plain
+    // reports only appears once `cleanup_grace_ms` has passed and KVCM has
+    // unregistered the reporter. Probe with a revoke so the wait writes
+    // nothing the sweep below could interleave with.
+    let mut seq = 2;
+    let error = loop {
+        match silent
+            .apply_external_kv_batch(revoke_batch(&worker, address, seq, &[104, 105, 106]))
+            .await
+        {
+            Err(error) => break error,
+            Ok(_) => {
+                seq += 1;
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "KVCM never unregistered the silent reporter"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    };
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+    assert!(
+        error.message().contains("NodeNotRegistered"),
+        "unexpected message: {}",
+        error.message()
+    );
+
+    // The reporter resumes: the bridge retries the batch, and the backend --
+    // which saw the `NODE_NOT_REGISTERED` failure -- prepends the registration
+    // that clears the tombstone. The request streaming again is the assertion;
+    // whether KVCM keeps *those* blocks is a separate race, handled below.
+    silent
+        .apply_external_kv_batch(report_batch(&worker, address, seq, &[104, 105, 106]))
+        .await
+        .expect("the retry re-registers the reporter and succeeds");
+
+    // KVCM dispatches the metadata sweep in the same breath as the unregister,
+    // and its generation guard only covers writes that landed before the sweep
+    // took its lease, so a re-report can still be swept. Converge on the answer
+    // instead of sleeping a magic duration: keep re-reporting until the
+    // reporter is routable again. This second backend is the reporter that
+    // stays up (it heartbeats), which keeps the liveness window out of the
+    // convergence.
+    let resumed = backend(&env, &instance, Some(HEARTBEAT));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        resumed
+            .apply_external_kv_batch(report_batch(&worker, address, seq, &[104, 105, 106]))
+            .await
+            .expect("a re-report after the tombstone cleared is accepted");
+        if prefix(&resumed, &[104, 105, 106], 0)
+            .await
+            .best_prefix_blocks
+            == 3
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reporter never became routable again after the tombstone cleared"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Reclaimed blocks stay reclaimed: only what was re-reported is indexed.
+    assert!(prefix(&resumed, &[101, 102, 103], 0)
+        .await
+        .matches
+        .is_empty());
+}
+
+// --- Query semantics --------------------------------------------------------
+
+/// Reporters with no router-facing address are excluded: KVCM knows the host,
+/// the Router cannot route to it.
+#[tokio::test]
+#[ignore]
+async fn reporters_without_a_router_address_are_excluded() {
+    let env = live_env!();
+    let instance = unique("noaddr");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let worker = format!("{instance}-w0");
+
+    // An empty address falls back to the worker id as the URI authority, so the
+    // report is still valid; only the answer drops the reporter.
+    backend
+        .apply_external_kv_batch(report_batch(&worker, "", 1, &[111, 112]))
+        .await
+        .expect("a report without an address is still accepted by KVCM");
+
+    let answer = prefix(&backend, &[111, 112], 0).await;
+    assert!(
+        answer.matches.is_empty(),
+        "an unroutable reporter must not be answered: {:?}",
+        answer.matches
+    );
+
+    // KVCM keeps the placement under the reporter id; the filter is ours, not
+    // KVCM's, so a router that learned the address later would see it again.
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    assert_eq!(
+        locals(&raw.query(&[111, 112], &["hbm"], 0).await),
+        HashMap::from([(worker, 2)])
+    );
+}
+
+/// The raw `p2p_host_count = 0` answer, i.e. the fast path:
+/// `p2p_1_fetch == 0`, `p2p_1_total_match == local`, and only reporters that
+/// hold the first block appear at all.
+#[tokio::test]
+#[ignore]
+async fn zero_p2p_host_count_answers_local_prefixes_only() {
+    let env = live_env!();
+    let instance = unique("p2pzero");
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let holder = "10.2.0.1:8080";
+    let short = "10.2.0.2:8080";
+    let late = "10.2.0.3:8080";
+
+    for (host, keys) in [
+        (holder, &[121i64, 122, 123][..]),
+        (short, &[121][..]),
+        (late, &[122][..]),
+    ] {
+        let mut events = vec![node_register(&["hbm"])];
+        events.extend(
+            keys.iter()
+                .map(|key| block_add(*key, "hbm", host, &["full"])),
+        );
+        assert_ok(
+            &raw.report(host, StorageType::StEventReportL1p5, events)
+                .await,
+            "report",
+        );
+    }
+
+    let answer = raw.query(&[121, 122, 123], &["hbm"], 0).await;
+    assert_eq!(
+        locals(&answer),
+        HashMap::from([(holder.to_string(), 3), (short.to_string(), 1),]),
+        "only reporters holding the first block are candidates, with local>0"
+    );
+    for host in &answer.hosts {
+        assert_eq!(host.p2p_1_fetch, 0, "p2p_host_count=0 computes no fetch");
+        assert_eq!(
+            host.p2p_1_total_match, host.local,
+            "p2p_host_count=0 leaves the local prefix unchanged"
+        );
+    }
+}
+
+/// An auto-registering backend on a given event-report channel. P2P merging
+/// only ever considers peers that reported on the L2 channel (KVCM's
+/// `vineyard://` locations), so the channel is the variable the P2P tests turn.
+fn channel_backend(
+    env: &LiveEnv,
+    instance_id: &str,
+    storage_type: StorageType,
+) -> KvcmIndexerBackend {
+    let mut config = KvcmBackendConfig::new(env.endpoint.clone(), instance_id);
+    config.storage_type = storage_type;
+    config.query_timeout = RPC_TIMEOUT;
+    config.apply_timeout = RPC_TIMEOUT;
+    config.heartbeat_interval = Some(HEARTBEAT);
+    config.auto_register = Some(KvcmAutoRegister {
+        instance_group: env.instance_group.clone(),
+        block_size: 128,
+        model_name: env.model_name.clone(),
+        dtype: env.dtype.clone(),
+    });
+    KvcmIndexerBackend::new(config).expect("the harness endpoint is a valid http endpoint")
+}
+
+/// One legacy whole-block report for `worker`, in order.
+async fn report_keys(backend: &KvcmIndexerBackend, worker: &str, address: &str, keys: &[i64]) {
+    backend
+        .apply_external_kv_batch(report_batch(worker, address, 1, keys))
+        .await
+        .expect("a legacy report is accepted");
+}
+
+/// Block hashes for the P2P topologies: only distinctness matters, KVCM
+/// computes the prefixes.
+const P2P_KEYS: [i64; 6] = [9101, 9102, 9103, 9104, 9105, 9106];
+
+/// The L2 direction of the channel binding, and the answer's P2P columns.
+///
+/// Topology (the numbers follow from `meta_searcher.cc:1690-1859`): two
+/// candidates holding the same local prefix `k0,k1`, plus one reporter holding
+/// `k2..k4` on L2 only. The reporter holds no block 0, so KVCM never answers for
+/// it (`local == 0`), but it is a peer source for the candidates.
+#[tokio::test]
+#[ignore]
+async fn p2p_extends_the_top_candidate_and_follows_the_budget() {
+    let env = live_env!();
+    let instance = unique("p2ptop");
+    let backend = channel_backend(&env, &instance, StorageType::StEventReportL2);
+    let keys = &P2P_KEYS[..5];
+    // Same local prefix for both candidates: the budget's tie-break is the host
+    // id, which is why the worker ids differ only in their last letter.
+    let top_a = format!("{instance}-wa");
+    let top_b = format!("{instance}-wb");
+    let peer = format!("{instance}-peer");
+    let addr_a = "http://127.0.0.1:31001";
+    let addr_b = "http://127.0.0.1:31002";
+    let addr_peer = "http://127.0.0.1:31003";
+    report_keys(&backend, &top_a, addr_a, &keys[..2]).await;
+    report_keys(&backend, &top_b, addr_b, &keys[..2]).await;
+    report_keys(&backend, &peer, addr_peer, &keys[2..]).await;
+
+    // P2P off: the fast path answers the local prefix, and the wire columns say
+    // exactly that (`p2p_prefix_blocks == matched_prefix_blocks`).
+    let answer = prefix_with_p2p(&backend, keys, 0, 0).await;
+    assert_eq!(
+        p2p_fields_by_address(&answer),
+        HashMap::from([
+            (addr_a.to_string(), (2, 2, 0)),
+            (addr_b.to_string(), (2, 2, 0)),
+        ]),
+        "with no P2P candidates every host is local-only"
+    );
+    assert_eq!(answer.best_prefix_blocks, 2);
+
+    // One candidate evaluated: the top of the budget (local tie → host id) is
+    // extended by the peer's segment, the other keeps its local answer. A
+    // backend that dropped the budget would extend nobody here.
+    let answer = prefix_with_p2p(&backend, keys, 0, 1).await;
+    assert_eq!(
+        p2p_fields_by_address(&answer),
+        HashMap::from([
+            (addr_a.to_string(), (2, 5, 3)),
+            (addr_b.to_string(), (2, 2, 0)),
+        ]),
+        "only the evaluated candidate grows, by the peer's three blocks"
+    );
+    assert_eq!(answer.best_prefix_blocks, 5);
+
+    // Two candidates evaluated: both grow.
+    let answer = prefix_with_p2p(&backend, keys, 0, 2).await;
+    assert_eq!(
+        p2p_fields_by_address(&answer),
+        HashMap::from([
+            (addr_a.to_string(), (2, 5, 3)),
+            (addr_b.to_string(), (2, 5, 3)),
+        ])
+    );
+    assert_eq!(answer.best_prefix_blocks, 5);
+
+    // Raw cross-check: the columns our answer is derived from, straight from
+    // KVCM, for the same budget. This is what pins the pass-through: the two
+    // views agree host by host, including the candidate left local-only.
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let raw_answer = raw.query(keys, &["hbm"], 1).await;
+    let by_host: HashMap<String, (i64, i64, i64)> = raw_answer
+        .hosts
+        .iter()
+        .map(|host| {
+            (
+                host.host_ip_port.clone(),
+                (host.local, host.p2p_1_total_match, host.p2p_1_fetch),
+            )
+        })
+        .collect();
+    assert_eq!(by_host.get(&top_a), Some(&(2, 5, 3)), "{by_host:?}");
+    assert_eq!(by_host.get(&top_b), Some(&(2, 2, 0)), "{by_host:?}");
+    assert!(
+        !by_host.contains_key(&peer),
+        "a reporter without block 0 is not an answer: {by_host:?}"
+    );
+}
+
+/// The L1P5 direction of the channel binding: the same topology reported on the
+/// default channel never feeds peer reuse, at any budget.
+///
+/// The binding is per *location*, not per reporter: L1P5 locations are a local
+/// hit signal and never a fetchable peer source, which is why a single-channel
+/// instance like this one (every reporter on L1P5, as one
+/// `KV_INDEXER_KVCM_STORAGE_TYPE` produces) sees no P2P at all. An instance
+/// mixing channels is not covered here -- an L1P5 reporter can still be extended
+/// by a peer that published on L2.
+#[tokio::test]
+#[ignore]
+async fn l1p5_reports_never_feed_peer_reuse() {
+    let env = live_env!();
+    let instance = unique("p2pl1p5");
+    let backend = channel_backend(&env, &instance, StorageType::StEventReportL1p5);
+    let keys = &P2P_KEYS[..5];
+    let top_a = format!("{instance}-wa");
+    let top_b = format!("{instance}-wb");
+    let peer = format!("{instance}-peer");
+    let addr_a = "http://127.0.0.1:31011";
+    let addr_b = "http://127.0.0.1:31012";
+    report_keys(&backend, &top_a, addr_a, &keys[..2]).await;
+    report_keys(&backend, &top_b, addr_b, &keys[..2]).await;
+    report_keys(&backend, &peer, "http://127.0.0.1:31013", &keys[2..]).await;
+
+    for budget in [1, 5] {
+        let answer = prefix_with_p2p(&backend, keys, 0, budget).await;
+        assert_eq!(
+            p2p_fields_by_address(&answer),
+            HashMap::from([
+                (addr_a.to_string(), (2, 2, 0)),
+                (addr_b.to_string(), (2, 2, 0)),
+            ]),
+            "budget {budget} on the L1P5 channel must leave the local answer alone"
+        );
+        assert_eq!(answer.best_prefix_blocks, 2);
+    }
+
+    // KVCM agrees: nothing on this channel becomes a peer source.
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let raw_answer = raw.query(keys, &["hbm"], 5).await;
+    for host in &raw_answer.hosts {
+        assert_eq!(
+            host.p2p_1_total_match, host.local,
+            "L1P5 peers must not extend {}",
+            host.host_ip_port
+        );
+        assert_eq!(host.p2p_1_fetch, 0);
+    }
+    assert!(
+        !locals(&raw_answer).contains_key(&peer),
+        "the peer is not a candidate either"
+    );
+}
+
+/// What the merge cannot do: it is a single-peer model. Here the prompt is
+/// covered by three reporters, but the servable prefix stops where the selected
+/// peer's coverage ends -- the second peer is never consulted, and the ask is
+/// the ceiling for both columns. `p2p_fetch_blocks` counts the block keys the
+/// peer supplies for those indices (KVCM deduplicates them internally; prefix
+/// queries carry distinct hashes, so the two readings coincide here).
+#[tokio::test]
+#[ignore]
+async fn p2p_merges_one_peer_only_and_respects_the_ask() {
+    let env = live_env!();
+    let instance = unique("p2pone");
+    let backend = channel_backend(&env, &instance, StorageType::StEventReportL2);
+    let keys = &P2P_KEYS[..6];
+    let target = format!("{instance}-wt");
+    let peer_x = format!("{instance}-peerx");
+    let peer_y = format!("{instance}-peery");
+    let addr_target = "http://127.0.0.1:31021";
+    let addr_x = "http://127.0.0.1:31022";
+    let addr_y = "http://127.0.0.1:31023";
+    report_keys(&backend, &target, addr_target, &keys[..3]).await;
+    report_keys(&backend, &peer_x, addr_x, &keys[3..5]).await;
+    report_keys(&backend, &peer_y, addr_y, &keys[5..]).await;
+
+    // peerX covers k3,k4 and stops; peerY holds only k5 and is not even
+    // considered (it does not hold the first uncovered key). The merged prefix
+    // is therefore 5, not 6: no scatter-gather across peers.
+    let answer = prefix_with_p2p(&backend, keys, 0, 1).await;
+    assert_eq!(
+        p2p_fields_by_address(&answer),
+        HashMap::from([(addr_target.to_string(), (3, 5, 2))]),
+        "one peer's contiguous segment, nothing stitched from the second"
+    );
+    // The invariant a real manager can be held to: it never reports more than
+    // the ask, so the clamp in `prefix_entry` stays a safety net here (the mock
+    // contract pins that branch, since a KVCM that over-reports cannot be
+    // constructed from real traffic).
+    assert!(
+        answer
+            .matches
+            .iter()
+            .all(|entry| entry.p2p_prefix_blocks <= answer.blocks_read),
+        "the ask bounds the servable prefix"
+    );
+
+    // The ask bounds both columns: with four keys the peer covers one block.
+    let answer = prefix_with_p2p(&backend, keys, 4, 1).await;
+    assert_eq!(answer.blocks_read, 4);
+    assert_eq!(
+        p2p_fields_by_address(&answer),
+        HashMap::from([(addr_target.to_string(), (3, 4, 1))])
+    );
+
+    // Raw cross-check of the single-peer merge.
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let raw_answer = raw.query(keys, &["hbm"], 1).await;
+    let by_host: HashMap<String, (i64, i64, i64)> = raw_answer
+        .hosts
+        .iter()
+        .map(|host| {
+            (
+                host.host_ip_port.clone(),
+                (host.local, host.p2p_1_total_match, host.p2p_1_fetch),
+            )
+        })
+        .collect();
+    assert_eq!(by_host.get(&target), Some(&(3, 5, 2)), "{by_host:?}");
+    assert!(
+        !by_host.contains_key(&peer_x) && !by_host.contains_key(&peer_y),
+        "peers are sources, not answers: {by_host:?}"
+    );
+}
+
+/// The reported medium decides which placements a query sees: the backend
+/// reports HBM and queries HBM, so a DRAM-filtered query is empty.
+#[tokio::test]
+#[ignore]
+async fn medium_filters_select_the_reported_medium() {
+    let env = live_env!();
+    let instance = unique("medium");
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let host = "10.3.0.1:8080";
+
+    assert_ok(
+        &raw.report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![
+                node_register(&["hbm"]),
+                block_add(131, "hbm", host, &["full"]),
+            ],
+        )
+        .await,
+        "hbm report",
+    );
+
+    assert_eq!(
+        locals(&raw.query(&[131], &["hbm"], 0).await),
+        HashMap::from([(host.to_string(), 1)])
+    );
+    assert!(
+        raw.query(&[131], &["mem"], 0).await.hosts.is_empty(),
+        "a mem-filtered query must not see an hbm placement"
+    );
+    assert!(
+        raw.query(&[131], &[], 0).await.hosts.len() == 1,
+        "an empty medium filter considers every medium"
+    );
+}
+
+/// `snapshot_required` marks a reporter lifecycle, not an error: KVCM asks for
+/// a reconciliation snapshot while the reporter has no committed snapshot
+/// version, and the first delta of a lifecycle is what creates that version —
+/// the request that creates it carries the flag too
+/// (`CacheManager::refresh_snapshot_response`: `committed.empty() ||
+/// created_generation`). A delta-only reporter therefore sees it exactly once
+/// per lifecycle.
+#[tokio::test]
+#[ignore]
+async fn snapshot_required_marks_the_start_of_a_reporter_lifecycle() {
+    let env = live_env!();
+    let instance = unique("snapshot");
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let host = "10.4.0.1:8080";
+
+    let registered = raw
+        .report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![node_register(&["hbm"])],
+        )
+        .await;
+    assert_ok(&registered, "registration only");
+    assert!(
+        registered.snapshot_required,
+        "a reporter with no committed version is asked for a snapshot"
+    );
+    assert!(registered.committed_snapshot_version.is_empty());
+
+    let first_delta = raw
+        .report(
+            host,
+            StorageType::StEventReportL1p5,
+            vec![block_add(141, "hbm", host, &["full"])],
+        )
+        .await;
+    assert_ok(&first_delta, "first delta");
+    assert!(
+        !first_delta.committed_snapshot_version.is_empty(),
+        "a delta commits a snapshot version"
+    );
+    assert!(
+        first_delta.snapshot_required,
+        "the request that created the version still asks for a snapshot"
+    );
+
+    for (what, events) in [
+        ("second delta", vec![block_add(142, "hbm", host, &["full"])]),
+        ("heartbeat only", vec![heartbeat()]),
+    ] {
+        let response = raw
+            .report(host, StorageType::StEventReportL1p5, events)
+            .await;
+        assert_ok(&response, what);
+        assert!(
+            !response.snapshot_required,
+            "{what}: an established lifecycle is not asked for a snapshot"
+        );
+    }
+}
+
+/// The other event-report channel: an L2 deployment reports `vineyard://` spec
+/// URIs and answers the same way (and only on the L2 channel). The router-side
+/// P2P dimension is out of scope here — this only pins the channel's plumbing.
+#[tokio::test]
+#[ignore]
+async fn l2_channel_accepts_vineyard_reports() {
+    let env = live_env!();
+    let instance = unique("l2");
+    let mut config = KvcmBackendConfig::new(env.endpoint.clone(), instance.clone());
+    config.storage_type = StorageType::StEventReportL2;
+    config.query_timeout = RPC_TIMEOUT;
+    config.apply_timeout = RPC_TIMEOUT;
+    config.heartbeat_interval = Some(HEARTBEAT);
+    config.auto_register = Some(KvcmAutoRegister {
+        instance_group: env.instance_group.clone(),
+        block_size: 128,
+        model_name: env.model_name.clone(),
+        dtype: env.dtype.clone(),
+    });
+    let backend =
+        KvcmIndexerBackend::new(config).expect("the harness endpoint is a valid http endpoint");
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30013";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[171, 172]))
+        .await
+        .expect("the L2 channel accepts vineyard:// spec URIs");
+    assert_eq!(
+        prefixes_by_address(&prefix(&backend, &[171, 172], 0).await),
+        HashMap::from([(address.to_string(), 2)])
+    );
+}
+
+/// `CLEAR_ALL_AT_TIER` has no KVCM equivalent, so the backend drops it and the
+/// cleared blocks stay indexed. Pinned here so the documented limitation fails
+/// loudly if KVCM ever grows an equivalent.
+#[tokio::test]
+#[ignore]
+async fn cleared_tiers_leave_stale_placements() {
+    let env = live_env!();
+    let instance = unique("clear");
+    let backend = auto_registering_backend(&env, &instance, 128);
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30012";
+
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[151, 152, 153]))
+        .await
+        .expect("report succeeds");
+    backend
+        .apply_external_kv_batch(clear_batch(&worker, address, 2))
+        .await
+        .expect("a clear is skipped, not failed");
+
+    let answer = prefix(&backend, &[151, 152, 153], 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([(address.to_string(), 3)]),
+        "skipped clears leave the stale placements indexed"
+    );
+}

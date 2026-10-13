@@ -339,11 +339,16 @@ pub struct CacheCandidate {
     pub worker: Arc<Worker>,
     pub matched_prefix_tokens: u64,
     pub uncached_tokens: u64,
-    /// Matched prefix length in blocks, as reported by the prefix signal.
-    /// Selection reads `matched_prefix_tokens`; the block count exists for
-    /// observability (the diverted-overlap histogram reads against the
+    /// Serveable prefix length in blocks: what this worker holds, plus the part
+    /// of it the signal says a peer can serve (equal to the held prefix when P2P
+    /// is off). Selection reads `matched_prefix_tokens`; the block count exists
+    /// for observability (the diverted-overlap histogram reads against the
     /// tree/indexer block domain).
     pub matched_prefix_blocks: u32,
+    /// Blocks of that prefix this worker must fetch from a peer; 0 when the
+    /// prefix is entirely local. Ranks workers whose serveable prefixes are
+    /// equal, because a peer pull is transfer work a local hit does not pay.
+    pub p2p_fetch_blocks: u32,
     /// Domain containing this candidate.
     pub candidate_range_id: String,
     /// Optional pending prefill limit checked against `E`.
@@ -691,6 +696,7 @@ mod tests {
                 matched_prefix_tokens: 75,
                 uncached_tokens: 25,
                 matched_prefix_blocks: 3,
+                p2p_fetch_blocks: 0,
                 candidate_range_id: "global".into(),
                 max_pending_prefill_tokens: None,
             }],
@@ -889,16 +895,22 @@ mod tests {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 8,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "gone".into(),
                         address: "http://gone:30000".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 6,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "hot".into(),
                         address: "http://hot:30000".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 4,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "other".into(),
                         address: "http://other:30000".into(),
                     },
@@ -933,16 +945,22 @@ mod tests {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 8,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "gone".into(),
                         address: "http://gone:30000".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 6,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "hot".into(),
                         address: "http://hot:30000".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 4,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "warm".into(),
                         address: "http://warm:30000".into(),
                     },
@@ -990,6 +1008,8 @@ mod tests {
             .enumerate()
             .map(|(index, worker)| sgl_kv_indexer::PrefixMatch {
                 matched_prefix_blocks: (index + 1) as u32,
+                p2p_prefix_blocks: 0,
+                p2p_fetch_blocks: 0,
                 worker_id: worker.id.0.clone(),
                 address: worker.url.clone(),
             })
@@ -1047,6 +1067,8 @@ mod tests {
             .iter()
             .map(|worker| sgl_kv_indexer::PrefixMatch {
                 matched_prefix_blocks: 4,
+                p2p_prefix_blocks: 0,
+                p2p_fetch_blocks: 0,
                 worker_id: worker.id.0.clone(),
                 address: worker.url.clone(),
             })
@@ -1097,11 +1119,15 @@ mod tests {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 4,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "half".into(),
                         address: "http://half:30000".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: 3,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: "below-ratio".into(),
                         address: "http://below-ratio:30000".into(),
                     },
@@ -1143,6 +1169,8 @@ mod tests {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![sgl_kv_indexer::PrefixMatch {
                     matched_prefix_blocks: 3,
+                    p2p_prefix_blocks: 0,
+                    p2p_fetch_blocks: 0,
                     worker_id: "weak".into(),
                     address: "http://weak:30000".into(),
                 }],
@@ -1175,6 +1203,8 @@ mod tests {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![sgl_kv_indexer::PrefixMatch {
                     matched_prefix_blocks: 2_048,
+                    p2p_prefix_blocks: 0,
+                    p2p_fetch_blocks: 0,
                     worker_id: "holder".into(),
                     address: "http://holder:30000".into(),
                 }],
@@ -1256,6 +1286,7 @@ mod tests {
             matched_prefix_tokens,
             uncached_tokens,
             matched_prefix_blocks: 0,
+            p2p_fetch_blocks: 0,
             candidate_range_id: "global".into(),
             max_pending_prefill_tokens,
         }

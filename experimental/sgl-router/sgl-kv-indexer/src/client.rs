@@ -35,6 +35,15 @@ pub struct PrefixMatch {
     pub address: String,
     /// Length of the contiguous request prefix this worker holds.
     pub matched_prefix_blocks: u32,
+    /// Prefix this worker can serve by fetching the rest from a peer: at least
+    /// `matched_prefix_blocks` once the client has asked for P2P **and the
+    /// server has a P2P source** (a backend without one answers 0), and 0 when
+    /// it has not (this client zeroes the column then, so it carries no
+    /// information). Selection reads the larger of the two.
+    pub p2p_prefix_blocks: u32,
+    /// Blocks of that P2P extension this worker does not hold itself; a transfer
+    /// cost, 0 when the served prefix is entirely local.
+    pub p2p_fetch_blocks: u32,
     /// Opaque worker id, for the caller's logs only.
     pub worker_id: String,
 }
@@ -95,9 +104,12 @@ impl std::error::Error for InvalidEndpoint {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixOutcome {
     Matched {
-        /// Sorted by `matched_prefix_blocks`, descending.
+        /// Sorted by the serveable prefix (`max(matched_prefix_blocks,
+        /// p2p_prefix_blocks)`), descending, cheapest peer transfer first on
+        /// ties. With P2P off that is the local prefix.
         matches: Vec<PrefixMatch>,
-        /// Longest contiguous prefix held by any single worker.
+        /// Longest prefix any single worker can serve: the largest serveable
+        /// prefix over the matches, local-only when P2P is off.
         best_prefix_blocks: u32,
     },
     /// No worker holds a prefix (or the request had no hashes).
@@ -113,6 +125,9 @@ pub struct PrefixIndexConfig {
     pub query_deadline: Duration,
     /// Maximum prefix-query RPCs issued concurrently by this client.
     pub max_inflight: usize,
+    /// How many top matching workers to ask the indexer to evaluate for
+    /// peer-to-peer reuse. 0 (the default) keeps queries local-only.
+    pub p2p_candidate_hosts: u32,
 }
 
 impl PrefixIndexConfig {
@@ -122,6 +137,7 @@ impl PrefixIndexConfig {
             endpoint: endpoint.into(),
             query_deadline: DEFAULT_QUERY_DEADLINE,
             max_inflight: DEFAULT_QUERY_MAX_INFLIGHT,
+            p2p_candidate_hosts: 0,
         }
     }
 }
@@ -138,6 +154,7 @@ pub trait PrefixIndex: Send + Sync {
 pub struct GrpcPrefixIndex {
     channel: Channel,
     deadline: Duration,
+    p2p_candidate_hosts: u32,
     prefix_query_semaphore: Semaphore,
 }
 
@@ -153,8 +170,24 @@ impl GrpcPrefixIndex {
         Ok(Self {
             channel: parse_endpoint(&config.endpoint)?.connect_lazy(),
             deadline: config.query_deadline,
+            p2p_candidate_hosts: config.p2p_candidate_hosts,
             prefix_query_semaphore: Semaphore::new(config.max_inflight),
         })
+    }
+
+    /// Maps a wire match into the router-facing signal. The P2P columns are
+    /// gated on having asked for them: a server that volunteers them anyway is
+    /// ignored, so with P2P off every consumer sees exactly the pre-P2P signal
+    /// rather than trusting the server to withhold the extension.
+    fn prefix_match(&self, matched: crate::pb::ExternalKvPrefixMatch) -> PrefixMatch {
+        let p2p = self.p2p_candidate_hosts > 0;
+        PrefixMatch {
+            address: matched.worker_address,
+            matched_prefix_blocks: matched.matched_prefix_blocks,
+            p2p_prefix_blocks: if p2p { matched.p2p_prefix_blocks } else { 0 },
+            p2p_fetch_blocks: if p2p { matched.p2p_fetch_blocks } else { 0 },
+            worker_id: matched.worker_id,
+        }
     }
 
     fn try_acquire_prefix_query(&self) -> Result<SemaphorePermit<'_>, PrefixIndexError> {
@@ -194,6 +227,7 @@ impl PrefixIndex for GrpcPrefixIndex {
             // transport-limited prefix cannot turn a partial scan into a perfect
             // hit.
             max_blocks: 0,
+            p2p_candidate_hosts: self.p2p_candidate_hosts,
         });
         // On the wire so the indexer can drop a query this caller already stopped
         // waiting for. The local timeout below stays the hard stop, since it also
@@ -211,11 +245,7 @@ impl PrefixIndex for GrpcPrefixIndex {
                 let matches = response
                     .matches
                     .into_iter()
-                    .map(|m| PrefixMatch {
-                        address: m.worker_address,
-                        matched_prefix_blocks: m.matched_prefix_blocks,
-                        worker_id: m.worker_id,
-                    })
+                    .map(|matched| self.prefix_match(matched))
                     .collect();
                 Ok(PrefixOutcome::Matched {
                     matches,
@@ -229,7 +259,7 @@ impl PrefixIndex for GrpcPrefixIndex {
 /// Validates the endpoint the operator configured. tonic itself only checks URI
 /// syntax, which accepts a host:port with no scheme and then fails on every
 /// connect, so the scheme and host are checked here.
-fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
+pub(crate) fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
     let reject = |reason: &'static str| InvalidEndpoint {
         endpoint: endpoint.to_string(),
         reason,
@@ -309,10 +339,58 @@ mod tests {
             MatchExternalKvPrefixRequest {
                 hashes,
                 max_blocks: 0,
+                p2p_candidate_hosts: 0,
             }
             .encoded_len()
                 <= MAX_GRPC_DECODING_MESSAGE_SIZE
         );
+    }
+
+    fn wire_match(
+        p2p_prefix_blocks: u32,
+        p2p_fetch_blocks: u32,
+    ) -> crate::pb::ExternalKvPrefixMatch {
+        crate::pb::ExternalKvPrefixMatch {
+            worker_address: "http://w0:30000".into(),
+            matched_prefix_blocks: 3,
+            worker_id: "worker-0".into(),
+            p2p_prefix_blocks,
+            p2p_fetch_blocks,
+        }
+    }
+
+    fn client_with(p2p_candidate_hosts: u32) -> GrpcPrefixIndex {
+        GrpcPrefixIndex::new(PrefixIndexConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            query_deadline: DEFAULT_QUERY_DEADLINE,
+            max_inflight: 1,
+            p2p_candidate_hosts,
+        })
+        .expect("valid endpoint")
+    }
+
+    /// Building a client needs a reactor, so even a pure mapping test runs on
+    /// the tokio runtime the production caller has.
+    #[tokio::test]
+    async fn p2p_columns_are_read_only_when_they_were_asked_for() {
+        let asked = client_with(4).prefix_match(wire_match(9, 4));
+        assert_eq!(asked.p2p_prefix_blocks, 9);
+        assert_eq!(asked.p2p_fetch_blocks, 4);
+        // P2P off: a server that reports an extension anyway must not change the
+        // signal selection sees, so "off" is a guarantee this client keeps
+        // rather than one it depends on.
+        let unasked = client_with(0).prefix_match(wire_match(9, 4));
+        assert_eq!(unasked.p2p_prefix_blocks, 0);
+        assert_eq!(unasked.p2p_fetch_blocks, 0);
+        // The pre-P2P fields are untouched either way.
+        assert_eq!(unasked.matched_prefix_blocks, 3);
+        assert_eq!(unasked.address, "http://w0:30000");
+        assert_eq!(unasked.worker_id, "worker-0");
+    }
+
+    #[test]
+    fn p2p_is_off_by_default() {
+        assert_eq!(PrefixIndexConfig::new("http://i:1").p2p_candidate_hosts, 0);
     }
 
     #[test]
@@ -367,6 +445,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_string(),
             query_deadline: DEFAULT_QUERY_DEADLINE,
             max_inflight: 1,
+            p2p_candidate_hosts: 0,
         })
         .expect("valid endpoint");
 

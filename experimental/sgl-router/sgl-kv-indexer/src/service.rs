@@ -371,15 +371,15 @@ pub fn component_bit(name: &str) -> Option<u32> {
 }
 
 /// Servable tiers as a `1 << TierType` bitmask. V1: HBM + DRAM, SSD excluded.
-const SERVABLE_TIER_MASK: u32 =
+pub(crate) const SERVABLE_TIER_MASK: u32 =
     (1 << (TierType::TierHbm as u32)) | (1 << (TierType::TierDram as u32));
 
 /// Highest `WorkerCacheSpec.version` this build interprets; a higher (future)
 /// version fails closed. Version 0 (proto default) is accepted as current.
-const SUPPORTED_SPEC_VERSION: u32 = 1;
+pub(crate) const SUPPORTED_SPEC_VERSION: u32 = 1;
 
 /// Whether `tier` is set in a `1 << TierType` bitmask.
-fn tier_in_mask(mask: u32, tier: i32) -> bool {
+pub(crate) fn tier_in_mask(mask: u32, tier: i32) -> bool {
     tier >= 0 && mask & (1u32 << tier) != 0
 }
 
@@ -450,7 +450,15 @@ pub(crate) fn compute_prefix_response(
                 return None;
             }
             let prefix = compute_worker_prefix(worker.spec.as_ref(), &worker.blocks);
-            (prefix > 0).then(|| (worker.worker_id.clone(), worker.address.clone(), prefix))
+            (prefix > 0).then(|| PrefixEntry {
+                worker_id: worker.worker_id.clone(),
+                address: worker.address.clone(),
+                matched_blocks: prefix,
+                // The rule engine answers local placement only; a backend with a
+                // P2P source reports its own entries instead.
+                p2p_blocks: 0,
+                p2p_fetch_blocks: 0,
+            })
         })
         .collect();
     assemble_prefix_response(entries, blocks_read)
@@ -635,23 +643,58 @@ fn component_available(
     })
 }
 
-/// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds
-/// the response, so `best_prefix_blocks` and the order come from one place.
+/// One worker's answer before assembly: its routing identity, the prefix it
+/// holds itself, and — where a backend evaluates P2P — the extension a peer can
+/// serve plus the transfer that costs. Backends without a P2P source leave both
+/// P2P fields 0.
+#[derive(Debug, Clone)]
+pub(crate) struct PrefixEntry {
+    pub(crate) worker_id: String,
+    pub(crate) address: String,
+    pub(crate) matched_blocks: u32,
+    pub(crate) p2p_blocks: u32,
+    pub(crate) p2p_fetch_blocks: u32,
+}
+
+impl PrefixEntry {
+    /// The prefix a caller can use: peer-served blocks count when a backend
+    /// reported them. This is the one quantity ordering, `best_prefix_blocks`
+    /// and the router's selection all read, so a caller that trusts the first
+    /// match cannot be handed a weaker answer than the one advertised as best.
+    fn servable_blocks(&self) -> u32 {
+        self.matched_blocks.max(self.p2p_blocks)
+    }
+}
+
+/// Sorts entries by servable prefix descending — cheapest peer transfer first on
+/// ties, since a peer-served extension is not free — and builds the response, so
+/// `best_prefix_blocks` and the order come from one place. With P2P off every
+/// entry's P2P fields are 0: the key degenerates to the local prefix and the
+/// order is exactly the pre-P2P one (a stable sort under an identical
+/// comparison, with an always-equal secondary key).
 pub(crate) fn assemble_prefix_response(
-    mut entries: Vec<(String, String, u32)>,
+    mut entries: Vec<PrefixEntry>,
     blocks_read: u32,
 ) -> MatchExternalKvPrefixResponse {
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
-    let best_prefix_blocks = entries.first().map(|entry| entry.2).unwrap_or(0);
+    entries.sort_by_key(|entry| {
+        (
+            std::cmp::Reverse(entry.servable_blocks()),
+            entry.p2p_fetch_blocks,
+        )
+    });
+    let best_prefix_blocks = entries
+        .first()
+        .map(PrefixEntry::servable_blocks)
+        .unwrap_or(0);
     let matches = entries
         .into_iter()
-        .map(
-            |(worker_id, worker_address, matched_prefix_blocks)| ExternalKvPrefixMatch {
-                worker_address,
-                matched_prefix_blocks,
-                worker_id,
-            },
-        )
+        .map(|entry| ExternalKvPrefixMatch {
+            worker_address: entry.address,
+            matched_prefix_blocks: entry.matched_blocks,
+            worker_id: entry.worker_id,
+            p2p_prefix_blocks: entry.p2p_blocks,
+            p2p_fetch_blocks: entry.p2p_fetch_blocks,
+        })
         .collect();
     MatchExternalKvPrefixResponse {
         matches,
@@ -732,6 +775,7 @@ mod tests {
             MatchExternalKvPrefixRequest {
                 hashes: vec![-1],
                 max_blocks: 0,
+                p2p_candidate_hosts: 0,
             },
         );
         KvIndexer::match_external_kv_prefix(service, request).await
@@ -1042,5 +1086,111 @@ mod tests {
         let s = spec(COMPONENT_FULL | COMPONENT_SWA, 100, &[hbm()], &[hbm()], &[]);
         let blocks = vec![legacy_blk(), legacy_blk()];
         assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
+    }
+
+    // --- P2P-aware assembly ---
+
+    fn entry(worker: &str, matched: u32, p2p: u32, fetch: u32) -> PrefixEntry {
+        PrefixEntry {
+            worker_id: worker.to_string(),
+            address: format!("http://{worker}:30000"),
+            matched_blocks: matched,
+            p2p_blocks: p2p,
+            p2p_fetch_blocks: fetch,
+        }
+    }
+
+    #[test]
+    fn assembly_orders_by_servable_prefix_then_by_transfer_cost() {
+        let response = assemble_prefix_response(
+            vec![
+                entry("local", 7, 0, 0),
+                entry("expensive-p2p", 3, 9, 4),
+                entry("cheap-p2p", 3, 9, 1),
+            ],
+            10,
+        );
+
+        // The P2P-extended worker outranks the local-only one even though it
+        // holds less itself, and the cheaper transfer wins the tie.
+        assert_eq!(response.best_prefix_blocks, 9);
+        let order: Vec<&str> = response
+            .matches
+            .iter()
+            .map(|m| m.worker_address.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "http://cheap-p2p:30000",
+                "http://expensive-p2p:30000",
+                "http://local:30000"
+            ]
+        );
+        // `matched_prefix_blocks` keeps reporting what the worker holds: the
+        // extension lives in its own field.
+        assert_eq!(response.matches[0].matched_prefix_blocks, 3);
+        assert_eq!(response.matches[0].p2p_prefix_blocks, 9);
+        assert_eq!(response.matches[0].p2p_fetch_blocks, 1);
+        assert_eq!(response.matches[2].matched_prefix_blocks, 7);
+        assert_eq!(response.matches[2].p2p_prefix_blocks, 0);
+    }
+
+    #[test]
+    fn assembly_without_p2p_is_the_pre_p2p_response() {
+        // Every backend that does not evaluate P2P reports zeros, which must
+        // leave the response byte-for-byte what it was: local order, zeroed P2P
+        // columns, best = longest local prefix. The tie pins P2P-off ordering to
+        // the input order a stable sort preserved before.
+        let response = assemble_prefix_response(
+            vec![
+                entry("w0", 5, 0, 0),
+                entry("w1", 9, 0, 0),
+                entry("w2", 5, 0, 0),
+            ],
+            10,
+        );
+        assert_eq!(response.best_prefix_blocks, 9);
+        assert_eq!(response.blocks_read, 10);
+        let seen: Vec<(&str, u32, u32, u32)> = response
+            .matches
+            .iter()
+            .map(|m| {
+                (
+                    m.worker_address.as_str(),
+                    m.matched_prefix_blocks,
+                    m.p2p_prefix_blocks,
+                    m.p2p_fetch_blocks,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("http://w1:30000", 9, 0, 0),
+                ("http://w0:30000", 5, 0, 0),
+                ("http://w2:30000", 5, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn assembly_never_sorts_a_worker_below_what_it_holds() {
+        // A P2P column smaller than the local prefix is not a downgrade: the
+        // servable prefix is the max, so ordering and `best_prefix_blocks` read
+        // the local length.
+        let response =
+            assemble_prefix_response(vec![entry("w0", 6, 2, 0), entry("w1", 4, 0, 0)], 10);
+        assert_eq!(response.best_prefix_blocks, 6);
+        assert_eq!(response.matches[0].worker_address, "http://w0:30000");
+        assert_eq!(response.matches[0].matched_prefix_blocks, 6);
+        assert_eq!(response.matches[0].p2p_prefix_blocks, 2);
+    }
+
+    #[test]
+    fn assembly_of_no_entries_has_no_best_prefix() {
+        let response = assemble_prefix_response(Vec::new(), 0);
+        assert!(response.matches.is_empty());
+        assert_eq!(response.best_prefix_blocks, 0);
     }
 }

@@ -138,6 +138,8 @@ impl PrefixIndex for FakePrefixIndex {
                 address: address.clone(),
                 matched_prefix_blocks,
                 worker_id: "fake-index-worker".into(),
+                p2p_prefix_blocks: 0,
+                p2p_fetch_blocks: 0,
             }],
             best_prefix_blocks: matched_prefix_blocks,
         })
@@ -168,11 +170,15 @@ impl PrefixIndex for TwoPrefixIndex {
                 PrefixMatch {
                     address: self.best_address.clone(),
                     matched_prefix_blocks: best_prefix_blocks,
+                    p2p_prefix_blocks: 0,
+                    p2p_fetch_blocks: 0,
                     worker_id: "best-index-worker".into(),
                 },
                 PrefixMatch {
                     address: self.lower_ranked_address.clone(),
                     matched_prefix_blocks: lower_ranked_prefix_blocks,
+                    p2p_prefix_blocks: 0,
+                    p2p_fetch_blocks: 0,
                     worker_id: "lower-index-worker".into(),
                 },
             ],
@@ -208,6 +214,7 @@ fn build_cache_ctx_with_affinity(
             url: "http://fake-indexer".into(),
             query_timeout_ms: 100,
             query_max_inflight: 32,
+            p2p_candidate_hosts: 0,
         }),
         ..Default::default()
     });
