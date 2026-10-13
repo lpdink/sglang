@@ -323,6 +323,13 @@ pub struct CacheArgs {
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
 
+    /// How many top matching workers each prefix query asks the KV Indexer to
+    /// evaluate for peer-to-peer reuse, largest matched prefix first. Requires
+    /// `--kv-indexer-endpoint` and a fleet that can actually fetch peer-held
+    /// blocks (see the Indexer README); omit it to keep routing local-only.
+    #[arg(long)]
+    pub kv_indexer_p2p_candidates: Option<u32>,
+
     /// Peer-bootstrap deadline in milliseconds. Requires --kv-peer-selector.
     /// Defaults to 600000 (10 minutes).
     #[arg(long)]
@@ -857,6 +864,14 @@ impl CacheArgs {
             "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
         );
         ensure!(
+            self.kv_indexer_p2p_candidates != Some(0),
+            "--kv-indexer-p2p-candidates must be greater than zero (omit it to disable P2P)"
+        );
+        ensure!(
+            self.kv_indexer_p2p_candidates.is_none() || self.kv_indexer_endpoint.is_some(),
+            "--kv-indexer-p2p-candidates requires --kv-indexer-endpoint"
+        );
+        ensure!(
             self.cache_pending_prefix_ttl_ms != Some(0),
             "--cache-pending-prefix-ttl-ms must be greater than zero"
         );
@@ -892,6 +907,7 @@ impl CacheArgs {
             url,
             query_timeout_ms: kv_indexer_query_timeout_ms,
             query_max_inflight: kv_indexer_query_max_inflight,
+            p2p_candidate_hosts: self.kv_indexer_p2p_candidates.unwrap_or(0),
         });
         Ok(Some(CacheAwareConfig {
             prefix_provider: cache_prefix_provider,
@@ -2212,6 +2228,77 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn kv_indexer_p2p_candidates_are_off_unless_requested() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+        ]))
+        .unwrap();
+        let indexer = c
+            .model
+            .cache_aware
+            .expect("cache-aware config")
+            .kv_indexer_endpoint
+            .expect("Indexer config");
+        // P2P is a supernode capability: a deployment that does not ask for it
+        // keeps querying local-only.
+        assert_eq!(indexer.p2p_candidate_hosts, 0);
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-indexer-p2p-candidates",
+            "3",
+        ]))
+        .unwrap();
+        let indexer = c
+            .model
+            .cache_aware
+            .expect("cache-aware config")
+            .kv_indexer_endpoint
+            .expect("Indexer config");
+        assert_eq!(indexer.p2p_candidate_hosts, 3);
+    }
+
+    #[test]
+    fn kv_indexer_p2p_candidates_require_endpoint_and_a_positive_count() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-indexer-p2p-candidates",
+            "3",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires --kv-indexer-endpoint"), "got: {err}");
+        // 0 is the default and means "off": spelling it out is a mistake, not a
+        // silent no-op.
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-indexer-p2p-candidates",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be greater than zero"), "got: {err}");
     }
 
     #[test]

@@ -19,7 +19,9 @@ use crate::pb::{
     MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
     TierType, WorkerCacheSpec,
 };
-use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner, COMPONENT_FULL};
+use crate::service::{
+    assemble_prefix_response, prefix_limit, PrefixEntry, WorkerPrefixScanner, COMPONENT_FULL,
+};
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -431,11 +433,13 @@ impl InMemoryKvIndexerBackend {
                         continue;
                     }
                     if let Some(worker) = state.workers.get(worker_id) {
-                        entries.push((
-                            worker_id.clone(),
-                            worker.address.clone(),
-                            (index + 1) as u32,
-                        ));
+                        entries.push(PrefixEntry {
+                            worker_id: worker_id.clone(),
+                            address: worker.address.clone(),
+                            matched_blocks: (index + 1) as u32,
+                            p2p_blocks: 0,
+                            p2p_fetch_blocks: 0,
+                        });
                     }
                 }
             }
@@ -468,11 +472,15 @@ impl InMemoryKvIndexerBackend {
 
         entries.extend(candidates.into_iter().filter_map(|candidate| {
             let prefix = candidate.scanner.prefix();
-            (!candidate.address.is_empty() && prefix > 0).then_some((
-                candidate.worker_id,
-                candidate.address,
-                prefix,
-            ))
+            (!candidate.address.is_empty() && prefix > 0).then_some(PrefixEntry {
+                worker_id: candidate.worker_id,
+                address: candidate.address,
+                matched_blocks: prefix,
+                // Placements live in this process; there is no peer to fetch
+                // from, so the P2P columns stay 0 whatever the request asked.
+                p2p_blocks: 0,
+                p2p_fetch_blocks: 0,
+            })
         }));
         Ok(assemble_prefix_response(entries, limit as u32))
     }

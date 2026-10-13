@@ -792,6 +792,8 @@ mod tests {
                     .iter()
                     .map(|(worker, blocks)| sgl_kv_indexer::PrefixMatch {
                         matched_prefix_blocks: *blocks,
+                        p2p_prefix_blocks: 0,
+                        p2p_fetch_blocks: 0,
                         worker_id: worker.id.0.clone(),
                         address: worker.url.clone(),
                     })

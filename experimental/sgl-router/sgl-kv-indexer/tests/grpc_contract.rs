@@ -139,6 +139,7 @@ async fn prefix_limit_rejects_over_real_grpc_without_blocking_writes() {
     let request = || MatchExternalKvPrefixRequest {
         hashes: vec![-1],
         max_blocks: 0,
+        p2p_candidate_hosts: 0,
     };
 
     let mut first_client = client.clone();
@@ -427,6 +428,7 @@ async fn match_prefix_over_grpc() {
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
             hashes: vec![a, b, d],
             max_blocks: 0,
+            p2p_candidate_hosts: 0,
         })
         .await
         .expect("prefix ok")
@@ -468,6 +470,7 @@ async fn prefix_query_scans_more_than_one_apply_chunk_over_grpc() {
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
             hashes,
             max_blocks: 0,
+            p2p_candidate_hosts: 0,
         })
         .await
         .expect("prefix request larger than one apply chunk")
@@ -500,6 +503,7 @@ async fn packed_signed_hash_query_can_exceed_tonics_default_receive_limit() {
     let request = MatchExternalKvPrefixRequest {
         hashes,
         max_blocks: 0,
+        p2p_candidate_hosts: 0,
     };
     assert!(request.encoded_len() > TONIC_DEFAULT_RECEIVE_LIMIT);
     assert!(request.encoded_len() < MAX_GRPC_DECODING_MESSAGE_SIZE);
@@ -521,6 +525,7 @@ async fn query_past_the_configured_limit_is_refused_as_out_of_range() {
     let request = MatchExternalKvPrefixRequest {
         hashes: (0..hash_count).map(|value| value as i64).collect(),
         max_blocks: 0,
+        p2p_candidate_hosts: 0,
     };
     assert!(request.encoded_len() > MAX_GRPC_DECODING_MESSAGE_SIZE);
 
@@ -572,6 +577,7 @@ async fn start_recording_deadlines(
         endpoint,
         query_deadline,
         max_inflight: sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT,
+        p2p_candidate_hosts: 0,
     })
     .expect("test endpoint is valid");
     (index, seen)

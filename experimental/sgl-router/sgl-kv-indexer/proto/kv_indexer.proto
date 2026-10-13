@@ -133,6 +133,16 @@ message MatchExternalKvPrefixRequest {
   // RPCs, a prefix query is not rejected for length; its scan holds O(1) state
   // per candidate worker, so length costs time rather than memory.
   uint32 max_blocks = 2;
+
+  // How many of the top matching workers to evaluate for peer-to-peer (P2P)
+  // reuse, largest local prefix first (the KVCM MetaService `p2p_host_count`
+  // column). 0, the default, keeps the answer local-only: every
+  // `p2p_prefix_blocks` comes back 0 and the backend does no P2P work. Non-zero
+  // asks a P2P-capable backend to also report, per evaluated worker, the prefix
+  // reachable by fetching the remainder from a peer. Only a fleet whose engines
+  // can actually pull KV from a peer (a supernode fabric) benefits; a backend
+  // without P2P support ignores it.
+  uint32 p2p_candidate_hosts = 3;
 }
 
 message ExternalKvPrefixMatch {
@@ -142,18 +152,39 @@ message ExternalKvPrefixMatch {
   // address are excluded from this response entirely.
   string worker_address = 1;
 
-  // Largest n such that this worker holds hashes[0..n) contiguously.
+  // Largest n such that this worker holds hashes[0..n) contiguously. 0 is a
+  // valid answer when the worker only reaches the prefix through a peer, so a
+  // caller that reads this field alone must treat 0 as "no local prefix", not as
+  // "no match": read the max with `p2p_prefix_blocks` below.
   uint32 matched_prefix_blocks = 2;
 
   // Opaque worker id, carried for the caller's logs only; not a routing key.
   string worker_id = 3;
+
+  // Prefix this worker can serve once peer-held blocks are allowed to count, i.e.
+  // the local prefix extended by what a peer can hand over (the KVCM MetaService
+  // `p2p_1_total_match` column). Always at least `matched_prefix_blocks`, and
+  // equal to it when P2P was evaluated but changed nothing, so callers read the
+  // larger of the two. 0 means the server did not evaluate P2P at all (the
+  // request asked for none, or the backend has no P2P source); 0 is a no-op
+  // under that max, never a regression.
+  uint32 p2p_prefix_blocks = 4;
+
+  // Blocks the worker must fetch from a peer to reach `p2p_prefix_blocks`: the
+  // part of that prefix it does not hold itself (the KVCM MetaService
+  // `p2p_1_fetch` column). A transfer-cost signal for choosing between workers
+  // whose servable prefixes are equal, not a hit count: 0 means the whole prefix
+  // is already local.
+  uint32 p2p_fetch_blocks = 5;
 }
 
 message MatchExternalKvPrefixResponse {
-  // Matches sorted by matched_prefix_blocks, descending.
+  // Matches sorted by their servable prefix (`max(matched_prefix_blocks,
+  // p2p_prefix_blocks)`) descending, cheapest peer transfer first on ties.
   repeated ExternalKvPrefixMatch matches = 1;
 
-  // The longest contiguous prefix held by any single worker (0 when no match).
+  // The longest prefix any single worker can serve: the maximum servable prefix
+  // over the matches. With P2P off this is the longest local prefix.
   uint32 best_prefix_blocks = 2;
 
   // How many blocks the server actually read placement for, so early termination

@@ -242,6 +242,7 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
         endpoint: indexer.url.clone(),
         query_deadline: Duration::from_millis(indexer.query_timeout_ms),
         max_inflight: indexer.query_max_inflight,
+        p2p_candidate_hosts: indexer.p2p_candidate_hosts,
     }
 }
 
@@ -560,10 +561,12 @@ mod tests {
             url: "http://127.0.0.1:50051".to_string(),
             query_timeout_ms: 25,
             query_max_inflight: 17,
+            p2p_candidate_hosts: 4,
         });
         assert_eq!(config.endpoint, "http://127.0.0.1:50051");
         assert_eq!(config.query_deadline, Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
+        assert_eq!(config.p2p_candidate_hosts, 4);
     }
 
     #[tokio::test]

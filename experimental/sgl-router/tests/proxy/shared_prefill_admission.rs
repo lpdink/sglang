@@ -125,6 +125,7 @@ impl Policy for CacheCandidatesPolicy {
                 matched_prefix_tokens: 1,
                 uncached_tokens: 1,
                 matched_prefix_blocks: 1,
+                p2p_fetch_blocks: 0,
                 candidate_range_id: "global".into(),
                 max_pending_prefill_tokens: None,
             }],

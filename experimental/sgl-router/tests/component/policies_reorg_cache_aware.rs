@@ -172,6 +172,8 @@ fn matches(entries: &[(&str, u32)]) -> PrefixOutcome {
                 address: (*url).into(),
                 worker_id: "not-a-routing-identity".into(),
                 matched_prefix_blocks: *depth,
+                p2p_prefix_blocks: 0,
+                p2p_fetch_blocks: 0,
             })
             .collect(),
         best_prefix_blocks: entries.iter().map(|(_, depth)| *depth).max().unwrap_or(0),

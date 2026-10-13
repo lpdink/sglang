@@ -84,6 +84,25 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+On a supernode whose engines can pull KV from a peer, add
+`--kv-indexer-p2p-candidates <N>` to have each query ask the Indexer to evaluate
+the `N` best matching workers for peer-served blocks. This only pays off where
+the data plane can really prefetch those blocks — the routing signal on its own
+sends the request to the worker that advertises the longest serveable prefix,
+including the part a peer holds (see the Indexer README's "Peer-to-peer reuse"
+section for the deployment prerequisites and that boundary). A worker's serveable
+prefix is then the larger of what it holds and what a peer can hand over, and
+workers with equal serveable prefixes are ranked by the smaller transfer first.
+The flag is off by default: without it every prefix is the local one and the
+Router's decisions are unchanged. It emits no metric of its own — watch
+`sgl_router_policy_decisions_total{policy="cache_aware"}` (the
+`cache_candidate` reason fires for a peer-extended pick, though it does not
+distinguish peer extension from a local hit) and
+`sgl_router_diverted_overlap_blocks`, whose depths move to serveable prefixes
+once a peer can extend them.
+`--kv-indexer-query-timeout-ms` and `--kv-indexer-query-max-inflight` are
+unaffected by it.
+
 ### KV-event gap replay
 
 ZMQ drops KV events at the publisher's high-water mark, and a lost removal

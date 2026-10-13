@@ -643,6 +643,10 @@ fn compare_cache_candidates(
     }
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
+        // Same serveable prefix, so the cheaper peer transfer wins: a P2P
+        // extension the engine has to pull costs work a local hit does not.
+        // With P2P off both sides are 0 and the key drops out.
+        .then_with(|| left.p2p_fetch_blocks.cmp(&right.p2p_fetch_blocks))
         .then_with(|| loads.compare_prefill_engines(&left.worker, &right.worker))
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
 }
@@ -954,6 +958,7 @@ mod tests {
                     matched_prefix_tokens: 90,
                     uncached_tokens: 10,
                     matched_prefix_blocks: 9,
+                    p2p_fetch_blocks: 0,
                     candidate_range_id: "global".into(),
                     max_pending_prefill_tokens: None,
                 },
@@ -962,6 +967,7 @@ mod tests {
                     matched_prefix_tokens: 80,
                     uncached_tokens: 20,
                     matched_prefix_blocks: 8,
+                    p2p_fetch_blocks: 0,
                     candidate_range_id: "global".into(),
                     max_pending_prefill_tokens: None,
                 },
@@ -1004,6 +1010,7 @@ mod tests {
             matched_prefix_tokens: 100 - uncached_tokens,
             uncached_tokens,
             matched_prefix_blocks: matched_blocks,
+            p2p_fetch_blocks: 0,
             candidate_range_id: "global".into(),
             max_pending_prefill_tokens: None,
         }
@@ -1576,5 +1583,61 @@ mod tests {
 
         assert_eq!(decision.selected.id, right.id);
         assert_eq!(decision.reason, DecisionReason::RangeFallback);
+    }
+
+    /// A worker whose serveable prefix is the same but which has to pull more of
+    /// it from a peer is the worse cache target, and the tie-break has to
+    /// survive into the winner selection: a load advantage must not buy a more
+    /// expensive transfer. (The pressure guard can still override this for a
+    /// materially more loaded peer; the loads here stay below that threshold.)
+    #[test]
+    fn equal_prefix_prefers_the_cheaper_peer_transfer_over_load() {
+        let local = worker("local");
+        let peer_heavy = worker("peer_heavy");
+        let mut candidate_local = candidate(&local, 10, 9);
+        candidate_local.p2p_fetch_blocks = 0;
+        let mut candidate_peer_heavy = candidate(&peer_heavy, 10, 9);
+        candidate_peer_heavy.p2p_fetch_blocks = 6;
+        let proposal = queue_gate_proposal(vec![candidate_local, candidate_peer_heavy], None);
+        // The expensive one is the idle worker, so load alone would choose it.
+        let loads = snapshot(&[(&local, 1, 8, 10, 10_000), (&peer_heavy, 0, 0, 10, 10_000)]);
+        let fleet = vec![Arc::clone(&local), Arc::clone(&peer_heavy)];
+
+        let resolution = resolve_cache_candidates(&proposal, 100, &loads, &fleet);
+
+        assert_eq!(
+            resolution
+                .decision
+                .expect("both candidates are admissible")
+                .selected
+                .id,
+            local.id
+        );
+    }
+
+    /// The switch-off path: with every transfer column at 0 — what a P2P-off
+    /// client sends — the same pair is decided by load exactly as before the
+    /// P2P dimension existed.
+    #[test]
+    fn zero_transfer_columns_leave_the_decision_to_load() {
+        let loaded = worker("loaded");
+        let idle = worker("idle");
+        let proposal = queue_gate_proposal(
+            vec![candidate(&loaded, 10, 9), candidate(&idle, 10, 9)],
+            None,
+        );
+        let loads = snapshot(&[(&loaded, 1, 8, 10, 10_000), (&idle, 0, 0, 10, 10_000)]);
+        let fleet = vec![Arc::clone(&loaded), Arc::clone(&idle)];
+
+        let resolution = resolve_cache_candidates(&proposal, 100, &loads, &fleet);
+
+        assert_eq!(
+            resolution
+                .decision
+                .expect("both candidates are admissible")
+                .selected
+                .id,
+            idle.id
+        );
     }
 }
